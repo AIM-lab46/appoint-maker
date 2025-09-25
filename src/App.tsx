@@ -10,8 +10,9 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * - テンプレに差し込んでコピー
  *
  * 重要な修正：
- * - `replaceAll` は使わず `.split(...).join(...)` に変更（古いターゲットでもOK）
- * - JSX内の `{{宛先名}} / {{候補一覧}}` は `{"{{宛先名}}"}` のように囲って解釈エラー回避
+ * - replaceAll は使わず split/join に変更（ターゲット差異で安全）
+ * - JSX内の {{宛先名}} / {{候補一覧}} を {"{{宛先名}}"} の形式にして解釈エラー回避
+ * - タイムトラック定数を重複宣言しないように一本化
  */
 
 type Slot = {
@@ -101,7 +102,7 @@ export default function App() {
     [slots, activeDateISO]
   );
 
-  // 30分刻みのトラック設定
+  // ===== タイムトラックの描画パラメータ（ここを一回だけ宣言） =====
   const MINUTES_PER_DAY = 24 * 60;
   const STEP = 30; // 30分
   const ROWS = MINUTES_PER_DAY / STEP; // 48
@@ -111,7 +112,7 @@ export default function App() {
   const minuteToY = (m: number) => (m / STEP) * ROW_HEIGHT;
   const yToMinute = (y: number) => clamp(floorTo30((y / ROW_HEIGHT) * STEP), 0, 1440);
 
-  // 新規バンド作成開始
+  // ===== 新規作成 & リサイズのハンドラ =====
   const onTrackPointerDown: React.PointerEventHandler<HTMLDivElement> = (e) => {
     if (!trackRef.current) return;
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
@@ -128,7 +129,6 @@ export default function App() {
     setHoverRange({ start: snapped, end: snapped + STEP });
   };
 
-  // 既存バンドの端を掴んだとき
   const onHandlePointerDown = (
     e: React.PointerEvent,
     slot: Slot,
@@ -146,7 +146,6 @@ export default function App() {
     setHoverRange({ start: slot.start, end: slot.end });
   };
 
-  // ドラッグ中
   const onTrackPointerMove: React.PointerEventHandler<HTMLDivElement> = (e) => {
     if (!dragging || !trackRef.current) return;
     const rect = trackRef.current.getBoundingClientRect();
@@ -167,7 +166,6 @@ export default function App() {
     }
   };
 
-  // ドラッグ終了
   const onTrackPointerUp: React.PointerEventHandler<HTMLDivElement> = () => {
     if (!dragging || !hoverRange) {
       setDragging(null);
@@ -192,7 +190,7 @@ export default function App() {
 
   const removeSlot = (id: string) => setSlots((prev) => prev.filter((s) => s.id !== id));
 
-  // 候補文の生成
+  // ===== 候補文の生成 =====
   const selectedSlotsSorted = useMemo(
     () =>
       [...slots].sort((a, b) =>
@@ -257,15 +255,6 @@ export default function App() {
   // 週末色
   const weekdayClasses = ["", "", "", "", "", "text-blue-600", "text-red-600"];
 
-  // タイムトラック設定の描画用値
-  const MINUTES_PER_DAY = 24 * 60;
-  const STEP = 30;
-  const ROWS = MINUTES_PER_DAY / STEP;
-  const ROW_HEIGHT = 24;
-  const TRACK_HEIGHT = ROWS * ROW_HEIGHT;
-
-  const minuteToY = (m: number) => (m / STEP) * ROW_HEIGHT;
-
   return (
     <div className="min-h-screen bg-gray-50">
       <div className="mx-auto max-w-md p-4">
@@ -317,60 +306,10 @@ export default function App() {
           <div
             ref={trackRef}
             className="relative h-[420px] overflow-auto border rounded-lg bg-[linear-gradient(#f8fafc_23px,transparent_24px)] [background-size:100%_24px]"
-            onPointerDown={(e) => {
-              if (!trackRef.current) return;
-              (e.target as HTMLElement).setPointerCapture((e as any).pointerId);
-              const rect = trackRef.current.getBoundingClientRect();
-              const y = (e as any).clientY - rect.top + trackRef.current.scrollTop;
-              const m = clamp(floorTo30((y / 24) * 30), 0, 1440);
-              setDragging({ mode: "new", startY: y, startMin: m, endMin: m + 30 });
-              setHoverRange({ start: m, end: m + 30 });
-            }}
-            onPointerMove={(e) => {
-              if (!dragging || !trackRef.current) return;
-              const rect = trackRef.current.getBoundingClientRect();
-              const y = (e as any).clientY - rect.top + trackRef.current.scrollTop;
-              const dy = y - dragging.startY;
-              const yToMinute = (yy: number) => clamp(floorTo30((yy / 24) * 30), 0, 1440);
-
-              if (dragging.mode === "new") {
-                const end = clamp(floorTo30(dragging.startMin + yToMinute(dy)), 0, 1440);
-                const s = Math.min(dragging.startMin, end);
-                const t = Math.max(dragging.startMin + 30, end);
-                setHoverRange({ start: clamp(s, 0, 1410), end: clamp(t, 30, 1440) });
-              } else if (dragging.mode === "resize-start") {
-                const newStart = clamp(floorTo30(dragging.startMin + yToMinute(dy)), 0, dragging.endMin - 30);
-                setHoverRange({ start: newStart, end: dragging.endMin });
-              } else if (dragging.mode === "resize-end") {
-                const newEnd = clamp(floorTo30(dragging.endMin + yToMinute(dy)), dragging.startMin + 30, 1440);
-                setHoverRange({ start: dragging.startMin, end: newEnd });
-              }
-            }}
-            onPointerUp={() => {
-              if (!dragging || !hoverRange) {
-                setDragging(null);
-                return;
-              }
-              if (dragging.mode === "new") {
-                const id = crypto.randomUUID();
-                setSlots((prev) => [
-                  ...prev,
-                  { id, dateISO: activeDateISO, start: hoverRange.start, end: hoverRange.end },
-                ]);
-              } else if (dragging.slotId) {
-                setSlots((prev) =>
-                  prev.map((s) =>
-                    s.id === dragging.slotId ? { ...s, start: hoverRange.start, end: hoverRange.end } : s
-                  )
-                );
-              }
-              setDragging(null);
-              setHoverRange(null);
-            }}
-            onPointerCancel={() => {
-              setDragging(null);
-              setHoverRange(null);
-            }}
+            onPointerDown={onTrackPointerDown}
+            onPointerMove={onTrackPointerMove}
+            onPointerUp={onTrackPointerUp}
+            onPointerCancel={onTrackPointerUp}
           >
             {/* 時刻目盛り（左） */}
             <div className="absolute left-0 top-0 w-full pointer-events-none">
@@ -396,7 +335,7 @@ export default function App() {
                   className="absolute left-10 right-3 rounded-lg bg-teal-500/25 border border-teal-500"
                   style={{ top, height }}
                 >
-                  {/* 上端/下端ハンドル（見た目4px、当たり判定は余白で広め） */}
+                  {/* 上下ハンドル（見た目4px、当たり判定は余白で広め） */}
                   <div
                     className="absolute top-0 left-0 right-0 h-1 bg-teal-500/60 cursor-[ns-resize]"
                     onPointerDown={(e) => onHandlePointerDown(e, s, "resize-start")}
