@@ -380,14 +380,18 @@ const SCROLL_THRESHOLD_PX = 3; // スクロール量がこれを超えたら「�
 
         {/* === 時間トラック === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
-          <div
-            ref={trackRef}
-            className="relative h-[420px] overflow-auto border rounded-lg bg-[linear-gradient(#f8fafc_23px,transparent_24px)] [background-size:100%_24px]"
-            onPointerDown={onTrackPointerDown}
-            onPointerMove={onTrackPointerMove}
-            onPointerUp={onTrackPointerUp}
-            onPointerCancel={onTrackPointerUp}
           >
+  {/* === デバッグオーバーレイ（右上） 一時表示 === */}
+  {showDebug && (
+    <div className="absolute z-10 right-2 top-2 text-[11px] bg-yellow-100 border border-yellow-300 rounded px-2 py-1 shadow">
+      <div>修正：タップで開始 → 伸ばすで調整</div>
+      <div>開始: {anchorStart != null ? mm(anchorStart) : "-"}</div>
+      <div>状態: {dragging ? dragging.mode : "none"}</div>
+      <div>選択: {hoverRange ? `${mm(hoverRange.start)}〜${mm(hoverRange.end)}` : "-"}</div>
+    </div>
+  )}
+  {/* 時刻目盛り（左） */}
+
             {/* 時刻目盛り（左） */}
             <div className="absolute left-0 top-0 w-full pointer-events-none">
               {Array.from({ length: ROWS + 1 }).map((_, i) => {
