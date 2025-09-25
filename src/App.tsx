@@ -1,34 +1,17 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
-/**
- * 目的：
- * - 月曜はじまりのカレンダーで日付を選ぶ
- * - 30分刻み（24h）で帯をドラッグして時間範囲を作成
- * - 指を離した後でも上下端をドラッグしてその場で微調整（伸縮OK）
- * - ドラッグ中に「HH:mm–HH:mm」をリアルタイム表示
- * - 複数日・複数枠に対応
- * - テンプレに差し込んでコピー
- *
- * 重要な修正：
- * - replaceAll は使わず split/join に変更（ターゲット差異で安全）
- * - JSX内の {{宛先名}} / {{候補一覧}} を {"{{宛先名}}"} の形式にして解釈エラー回避
- * - タイムトラック定数を重複宣言しないように一本化
- */
-
 type Slot = {
   id: string;
-  dateISO: string;   // 例: "2025-09-25"
-  start: number;     // 分（0..1440）
-  end: number;       // 分（0..1440） start < end
+  dateISO: string; // "2025-09-25"
+  start: number;   // minutes 0..1440
+  end: number;     // minutes 0..1440 (start < end)
 };
 
 const toISODate = (d: Date) => d.toISOString().slice(0, 10);
 const pad = (n: number) => (n < 10 ? `0${n}` : `${n}`);
-const minutesToHHmm = (m: number) => `${pad(Math.floor(m / 60))}:${pad(m % 60)}`;
+const mm = (m: number) => `${pad((m / 60) | 0)}:${pad(m % 60)}`;
 const floorTo30 = (m: number) => Math.floor(m / 30) * 30;
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
-
-/** 月曜(1)はじまりの曜日番号に調整: 0..6 -> 月..日 */
 const weekdayMonStart = (jsDay: number) => (jsDay + 6) % 7;
 
 function useLocalStorage<T>(key: string, initial: T) {
@@ -53,36 +36,41 @@ const defaultTemplate =
   `上記日時でもしご都合が合わない際は再度調整いたしますので、ご一報いただけますと幸いです。\n何卒宜しくお願いいたします。`;
 
 export default function App() {
-  // 今日 & 表示する年月
+  // 今日 & カレンダー表示年月
   const today = useMemo(() => new Date(), []);
   const [year, setYear] = useState(today.getFullYear());
-  const [month, setMonth] = useState(today.getMonth()); // 0=Jan
-
-  // 選択中の日付
+  const [month, setMonth] = useState(today.getMonth());
   const [activeDateISO, setActiveDateISO] = useState<string>(toISODate(today));
 
-  // 枠データ
+  // 保存データ
   const [slots, setSlots] = useLocalStorage<Slot[]>("am_slots", []);
-
-  // テンプレと宛先名
   const [template, setTemplate] = useLocalStorage<string>("am_template", defaultTemplate);
   const [toName, setToName] = useLocalStorage<string>("am_to_name", "");
 
-  // ドラッグ状態
+  // ドラッグ/リサイズ管理
   const trackRef = useRef<HTMLDivElement | null>(null);
   const [dragging, setDragging] = useState<
     | null
     | {
         mode: "new" | "resize-start" | "resize-end";
-        startY: number;
-        startMin: number; // バンド開始分(ドラッグ開始時)
-        endMin: number;   // バンド終了分(ドラッグ開始時)
-        slotId?: string;  // リサイズ対象
+        startY: number;   // screen y at start
+        startMin: number; // minute start at drag start
+        endMin: number;   // minute end at drag start
+        slotId?: string;
       }
   >(null);
   const [hoverRange, setHoverRange] = useState<{ start: number; end: number } | null>(null);
 
-  // カレンダーの計算
+  // ==== タイムトラック描画パラメータ ====
+  const MINUTES_PER_DAY = 24 * 60;
+  const STEP = 30;
+  const ROWS = MINUTES_PER_DAY / STEP; // 48
+  const ROW_HEIGHT = 24;               // px
+  const TRACK_HEIGHT = ROWS * ROW_HEIGHT;
+  const minuteToY = (m: number) => (m / STEP) * ROW_HEIGHT;
+  const yToMinute = (y: number) => clamp(floorTo30((y / ROW_HEIGHT) * STEP), 0, 1440);
+
+  // === 月カレンダー計算 ===
   const firstOfMonth = useMemo(() => new Date(year, month, 1), [year, month]);
   const daysInMonth = useMemo(() => new Date(year, month + 1, 0).getDate(), [year, month]);
   const leadingBlanks = useMemo(() => weekdayMonStart(firstOfMonth.getDay()), [firstOfMonth]);
@@ -96,57 +84,89 @@ export default function App() {
     return arr;
   }, [year, month, leadingBlanks, daysInMonth]);
 
-  // その日の枠
+  // 当日枠
   const daySlots = useMemo(
     () => slots.filter((s) => s.dateISO === activeDateISO).sort((a, b) => a.start - b.start),
     [slots, activeDateISO]
   );
 
-  // ===== タイムトラックの描画パラメータ（ここを一回だけ宣言） =====
-  const MINUTES_PER_DAY = 24 * 60;
-  const STEP = 30; // 30分
-  const ROWS = MINUTES_PER_DAY / STEP; // 48
-  const ROW_HEIGHT = 24; // px（モバイルで触りやすい高さ）
-  const TRACK_HEIGHT = ROWS * ROW_HEIGHT; // 全高
+  // === 追加・マージ・重複排除ロジック ===
+  function addOrMergeSlot(dateISO: string, start: number, end: number) {
+    start = clamp(start, 0, 1410);
+    end = clamp(end, 30, 1440);
+    if (start >= end) return;
 
-  const minuteToY = (m: number) => (m / STEP) * ROW_HEIGHT;
-  const yToMinute = (y: number) => clamp(floorTo30((y / ROW_HEIGHT) * STEP), 0, 1440);
+    setSlots((prev) => {
+      // 完全重複は無視
+      if (prev.some((p) => p.dateISO === dateISO && p.start === start && p.end === end)) return prev;
 
-  // ===== 新規作成 & リサイズのハンドラ =====
+      // 同日で重なり or 接しているものはマージ
+      let mergedStart = start;
+      let mergedEnd = end;
+      const rest: Slot[] = [];
+      for (const p of prev) {
+        if (p.dateISO !== dateISO) {
+          rest.push(p);
+          continue;
+        }
+        const overlap = !(p.end <= mergedStart || mergedEnd <= p.start); // 交差
+        const touching = p.end === mergedStart || mergedEnd === p.start; // 端が接する
+        if (overlap || touching) {
+          mergedStart = Math.min(mergedStart, p.start);
+          mergedEnd = Math.max(mergedEnd, p.end);
+        } else {
+          rest.push(p);
+        }
+      }
+      return [
+        ...rest,
+        { id: crypto.randomUUID(), dateISO, start: mergedStart, end: mergedEnd },
+      ].sort((a, b) =>
+        a.dateISO === b.dateISO ? a.start - b.start : a.dateISO.localeCompare(b.dateISO)
+      );
+    });
+  }
+
+  const removeSlot = (id: string) => setSlots((prev) => prev.filter((s) => s.id !== id));
+
+  // === ジェスチャ制御（long-pressで新規作成） ===
+  const pressInfo = useRef<{ timer: number | null; startY: number; activated: boolean } | null>(null);
+  const LONG_PRESS_MS = 200;
+  const MOVE_CANCEL_PX = 8;
+
   const onTrackPointerDown: React.PointerEventHandler<HTMLDivElement> = (e) => {
+    // 子要素（ボタンやバンド）を触ったら新規作成しない
+    if (e.currentTarget !== e.target) return;
     if (!trackRef.current) return;
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+
     const rect = trackRef.current.getBoundingClientRect();
     const y = e.clientY - rect.top + trackRef.current.scrollTop;
-    const m = yToMinute(y);
-    const snapped = floorTo30(m);
-    setDragging({
-      mode: "new",
-      startY: y,
-      startMin: snapped,
-      endMin: snapped + STEP, // 最低30分
-    });
-    setHoverRange({ start: snapped, end: snapped + STEP });
-  };
+    pressInfo.current = { timer: null, startY: y, activated: false };
 
-  const onHandlePointerDown = (
-    e: React.PointerEvent,
-    slot: Slot,
-    mode: "resize-start" | "resize-end"
-  ) => {
-    e.stopPropagation();
-    (e.target as HTMLElement).setPointerCapture((e as any).pointerId);
-    setDragging({
-      mode,
-      startY: e.clientY,
-      startMin: slot.start,
-      endMin: slot.end,
-      slotId: slot.id,
-    });
-    setHoverRange({ start: slot.start, end: slot.end });
+    // long-press で作成開始
+    const t = window.setTimeout(() => {
+      if (!pressInfo.current) return;
+      const snapped = yToMinute(pressInfo.current.startY);
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+      setDragging({ mode: "new", startY: pressInfo.current.startY, startMin: snapped, endMin: snapped + STEP });
+      setHoverRange({ start: snapped, end: snapped + STEP });
+      pressInfo.current.activated = true;
+    }, LONG_PRESS_MS);
+    pressInfo.current.timer = t;
   };
 
   const onTrackPointerMove: React.PointerEventHandler<HTMLDivElement> = (e) => {
+    if (pressInfo.current && !pressInfo.current.activated) {
+      // long-press 前に大きく動いたらスクロール扱い（キャンセル）
+      const rect = trackRef.current!.getBoundingClientRect();
+      const y = e.clientY - rect.top + (trackRef.current!.scrollTop);
+      if (Math.abs(y - pressInfo.current.startY) > MOVE_CANCEL_PX) {
+        if (pressInfo.current.timer) window.clearTimeout(pressInfo.current.timer);
+        pressInfo.current = null;
+      }
+      return;
+    }
+
     if (!dragging || !trackRef.current) return;
     const rect = trackRef.current.getBoundingClientRect();
     const y = e.clientY - rect.top + trackRef.current.scrollTop;
@@ -155,7 +175,7 @@ export default function App() {
     if (dragging.mode === "new") {
       const end = clamp(floorTo30(dragging.startMin + yToMinute(dy)), 0, 1440);
       const s = Math.min(dragging.startMin, end);
-      const t = Math.max(dragging.startMin + STEP, end); // 最低30分
+      const t = Math.max(dragging.startMin + STEP, end);
       setHoverRange({ start: clamp(s, 0, 1410), end: clamp(t, 30, 1440) });
     } else if (dragging.mode === "resize-start") {
       const newStart = clamp(floorTo30(dragging.startMin + yToMinute(dy)), 0, dragging.endMin - STEP);
@@ -167,30 +187,28 @@ export default function App() {
   };
 
   const onTrackPointerUp: React.PointerEventHandler<HTMLDivElement> = () => {
+    if (pressInfo.current) {
+      if (pressInfo.current.timer) window.clearTimeout(pressInfo.current.timer);
+      pressInfo.current = null;
+    }
     if (!dragging || !hoverRange) {
       setDragging(null);
+      setHoverRange(null);
       return;
     }
     if (dragging.mode === "new") {
-      const id = crypto.randomUUID();
-      setSlots((prev) => [
-        ...prev,
-        { id, dateISO: activeDateISO, start: hoverRange.start, end: hoverRange.end },
-      ]);
+      addOrMergeSlot(activeDateISO, hoverRange.start, hoverRange.end);
     } else if (dragging.slotId) {
+      // 既存枠のサイズ変更
       setSlots((prev) =>
-        prev.map((s) =>
-          s.id === dragging.slotId ? { ...s, start: hoverRange.start, end: hoverRange.end } : s
-        )
+        prev.map((s) => (s.id === dragging.slotId ? { ...s, start: hoverRange.start, end: hoverRange.end } : s))
       );
     }
     setDragging(null);
     setHoverRange(null);
   };
 
-  const removeSlot = (id: string) => setSlots((prev) => prev.filter((s) => s.id !== id));
-
-  // ===== 候補文の生成 =====
+  // === 出力テキスト ===
   const selectedSlotsSorted = useMemo(
     () =>
       [...slots].sort((a, b) =>
@@ -206,18 +224,13 @@ export default function App() {
       const md = `${d.getMonth() + 1}月${d.getDate()}日（${"月火水木金土日"[weekdayMonStart(d.getDay())]}）`;
       return md;
     };
-    // 同日をまとめて箇条書き
     const grouped: Record<string, Slot[]> = {};
-    selectedSlotsSorted.forEach((s) => {
-      (grouped[s.dateISO] ??= []).push(s);
-    });
+    selectedSlotsSorted.forEach((s) => ((grouped[s.dateISO] ??= []).push(s)));
     const lines: string[] = [];
     Object.keys(grouped)
       .sort()
       .forEach((iso) => {
-        const times = grouped[iso]
-          .map((s) => `${minutesToHHmm(s.start)}〜${minutesToHHmm(s.end)}`)
-          .join("、");
+        const times = grouped[iso].map((s) => `${mm(s.start)}〜${mm(s.end)}`).join("、");
         lines.push(`・${fmt(iso)}：${times}`);
       });
     return lines.join("\n");
@@ -225,10 +238,7 @@ export default function App() {
 
   const outputText = useMemo(() => {
     const name = toName.trim() || "（宛先名）";
-    // replaceAll ではなく split/join にすることで古いターゲットでもOK
-    return template
-      .split("{{宛先名}}").join(name)
-      .split("{{候補一覧}}").join(candidateListText);
+    return template.split("{{宛先名}}").join(name).split("{{候補一覧}}").join(candidateListText);
   }, [template, toName, candidateListText]);
 
   const copy = async () => {
@@ -240,7 +250,6 @@ export default function App() {
     }
   };
 
-  // 月移動
   const prevMonth = () => {
     const d = new Date(year, month - 1, 1);
     setYear(d.getFullYear());
@@ -252,8 +261,42 @@ export default function App() {
     setMonth(d.getMonth());
   };
 
-  // 週末色
   const weekdayClasses = ["", "", "", "", "", "text-blue-600", "text-red-600"];
+
+  // 候補一覧（削除つき表示）
+  function renderGroupedListWithRemove() {
+    const grouped: Record<string, Slot[]> = {};
+    selectedSlotsSorted.forEach((s) => ((grouped[s.dateISO] ??= []).push(s)));
+    const keys = Object.keys(grouped).sort();
+    if (keys.length === 0) return <div className="text-sm text-gray-400">（候補なし）</div>;
+    return (
+      <div className="space-y-2">
+        {keys.map((iso) => {
+          const d = new Date(iso + "T00:00:00");
+          const title = `${d.getMonth() + 1}月${d.getDate()}日（${"月火水木金土日"[weekdayMonStart(d.getDay())]}）`;
+          return (
+            <div key={iso}>
+              <div className="text-sm font-semibold mb-1">{title}</div>
+              <div className="flex flex-wrap gap-2">
+                {grouped[iso].map((s) => (
+                  <div key={s.id} className="flex items-center gap-1 text-xs border rounded px-2 py-1 bg-white">
+                    <span>{mm(s.start)}〜{mm(s.end)}</span>
+                    <button
+                      className="text-red-600 hover:underline"
+                      onClick={() => removeSlot(s.id)}
+                      onPointerDown={(e) => e.stopPropagation()}
+                    >
+                      削除
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -263,17 +306,13 @@ export default function App() {
         {/* === カレンダー === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
           <div className="flex items-center justify-between mb-2">
-            <button onClick={prevMonth} className="px-3 py-1 rounded bg-gray-100 hover:bg-gray-200">
-              ←
-            </button>
+            <button onClick={prevMonth} className="px-3 py-1 rounded bg-gray-100 hover:bg-gray-200">←</button>
             <div className="font-semibold">{year}年 {month + 1}月</div>
-            <button onClick={nextMonth} className="px-3 py-1 rounded bg-gray-100 hover:bg-gray-200">
-              →
-            </button>
+            <button onClick={nextMonth} className="px-3 py-1 rounded bg-gray-100 hover:bg-gray-200">→</button>
           </div>
           <div className="grid grid-cols-7 gap-1 text-center text-sm font-medium mb-1">
             {["月","火","水","木","金","土","日"].map((w, i) => (
-              <div key={w} className={weekdayClasses[i+0]}>{w}</div>
+              <div key={w} className={weekdayClasses[i]}>{w}</div>
             ))}
           </div>
           <div className="grid grid-cols-7 gap-1">
@@ -287,9 +326,7 @@ export default function App() {
                 <button
                   key={iso}
                   onClick={() => setActiveDateISO(iso)}
-                  className={`h-10 rounded-lg border text-sm ${wkClass} ${
-                    isActive ? "bg-teal-100 border-teal-300" : "bg-white border-gray-200 hover:bg-gray-50"
-                  }`}
+                  className={`h-10 rounded-lg border text-sm ${wkClass} ${isActive ? "bg-teal-100 border-teal-300" : "bg-white border-gray-200 hover:bg-gray-50"}`}
                 >
                   {d.getDate()}
                 </button>
@@ -300,9 +337,6 @@ export default function App() {
 
         {/* === 時間トラック === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
-          <div className="text-sm font-medium mb-2">
-            {activeDateISO} の空き時間（30分刻み、帯の上下4pxで伸縮）
-          </div>
           <div
             ref={trackRef}
             className="relative h-[420px] overflow-auto border rounded-lg bg-[linear-gradient(#f8fafc_23px,transparent_24px)] [background-size:100%_24px]"
@@ -316,10 +350,9 @@ export default function App() {
               {Array.from({ length: ROWS + 1 }).map((_, i) => {
                 const m = i * STEP;
                 const y = minuteToY(m);
-                const isHour = m % 60 === 0;
                 return (
                   <div key={i} style={{ top: y - 8 }} className="absolute left-2 text-[10px] text-gray-400">
-                    {isHour ? minutesToHHmm(m) : ""}
+                    {m % 60 === 0 ? mm(m) : ""}
                   </div>
                 );
               })}
@@ -335,22 +368,31 @@ export default function App() {
                   className="absolute left-10 right-3 rounded-lg bg-teal-500/25 border border-teal-500"
                   style={{ top, height }}
                 >
-                  {/* 上下ハンドル（見た目4px、当たり判定は余白で広め） */}
+                  {/* ハンドル（上下4px） */}
                   <div
                     className="absolute top-0 left-0 right-0 h-1 bg-teal-500/60 cursor-[ns-resize]"
-                    onPointerDown={(e) => onHandlePointerDown(e, s, "resize-start")}
+                    onPointerDown={(e) => {
+                      e.stopPropagation();
+                      (e.target as HTMLElement).setPointerCapture((e as any).pointerId);
+                      setDragging({ mode: "resize-start", startY: (e as any).clientY, startMin: s.start, endMin: s.end, slotId: s.id });
+                      setHoverRange({ start: s.start, end: s.end });
+                    }}
                   />
                   <div
                     className="absolute bottom-0 left-0 right-0 h-1 bg-teal-500/60 cursor-[ns-resize]"
-                    onPointerDown={(e) => onHandlePointerDown(e, s, "resize-end")}
+                    onPointerDown={(e) => {
+                      e.stopPropagation();
+                      (e.target as HTMLElement).setPointerCapture((e as any).pointerId);
+                      setDragging({ mode: "resize-end", startY: (e as any).clientY, startMin: s.start, endMin: s.end, slotId: s.id });
+                      setHoverRange({ start: s.start, end: s.end });
+                    }}
                   />
                   <div className="absolute inset-0 flex items-center justify-between px-2 text-xs">
-                    <div className="font-medium">
-                      {minutesToHHmm(s.start)}〜{minutesToHHmm(s.end)}
-                    </div>
+                    <div className="font-medium">{mm(s.start)}〜{mm(s.end)}</div>
                     <button
                       className="px-2 py-0.5 text-[11px] rounded bg-white/90 border hover:bg-red-50"
                       onClick={() => removeSlot(s.id)}
+                      onPointerDown={(e) => e.stopPropagation()}
                     >
                       削除
                     </button>
@@ -366,22 +408,28 @@ export default function App() {
                 style={{ top: minuteToY(hoverRange.start), height: minuteToY(hoverRange.end) - minuteToY(hoverRange.start) }}
               >
                 <div className="absolute right-2 top-1 text-xs font-semibold bg-white/70 px-1 rounded">
-                  {minutesToHHmm(hoverRange.start)}〜{minutesToHHmm(hoverRange.end)}
+                  {mm(hoverRange.start)}〜{mm(hoverRange.end)}
                 </div>
               </div>
             )}
 
-            {/* スクロール領域のためのダミー */}
+            {/* スクロール用のダミー */}
             <div style={{ height: TRACK_HEIGHT }} />
           </div>
         </div>
 
-        {/* === 候補一覧 & コピー === */}
+        {/* === 候補一覧（テキスト） === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
-          <div className="text-sm font-medium mb-2">候補一覧</div>
+          <div className="text-sm font-medium mb-2">候補一覧（テキスト）</div>
           <pre className="text-sm p-2 bg-gray-50 rounded border overflow-auto whitespace-pre-wrap">
 {candidateListText}
           </pre>
+        </div>
+
+        {/* === 候補一覧（削除ボタン付き） === */}
+        <div className="bg-white rounded-xl shadow p-3 mb-4">
+          <div className="text-sm font-medium mb-2">候補の編集</div>
+          {renderGroupedListWithRemove()}
         </div>
 
         {/* === テンプレ === */}
@@ -395,10 +443,7 @@ export default function App() {
             />
             <button
               className="px-3 py-2 rounded bg-gray-100 border hover:bg-gray-200"
-              onClick={() => {
-                setToName("");
-                setTemplate(defaultTemplate);
-              }}
+              onClick={() => { setToName(""); setTemplate(defaultTemplate); }}
               title="テンプレを初期化"
             >
               初期化
