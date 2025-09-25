@@ -61,6 +61,18 @@ export default function App() {
   >(null);
   const [hoverRange, setHoverRange] = useState<{ start: number; end: number } | null>(null);
 
+// === 一時デバッグ表示（どこを修正したか画面で可視化） ===
+const [showDebug, setShowDebug] = useState(true); // ← 一時的にONで開始
+
+// --- タップ→伸ばす用のアンカー & ジェスチャ判定 ---
+const [anchorStart, setAnchorStart] = useState<number | null>(null);
+/** ポインタダウン時の一時情報（スクロール判定に使う） */
+const gesture = useRef<{ downY: number; downTime: number; scrollTop: number } | null>(null);
+
+// 判定しきい値（必要に応じて微調整）
+const MOVE_THRESHOLD_PX = 6;   // これ以上動いたら「ドラッグ」
+const SCROLL_THRESHOLD_PX = 3; // スクロール量がこれを超えたら「スクロール扱い」で選択キャンセル
+
   // --- タップ→伸ばす用のアンカー & ジェスチャ判定 ---
   const [anchorStart, setAnchorStart] = useState<number | null>(null);
   /** ポインタダウン時の一時情報（スクロール判定に使う） */
@@ -141,104 +153,93 @@ export default function App() {
 
   // === タップ→伸ばす：ハンドラ ===
   const onTrackPointerDown: React.PointerEventHandler<HTMLDivElement> = (e) => {
-    // 子要素（削除ボタン等）を触ったら、新規作成/ドラッグを開始しない
-    if (e.currentTarget !== e.target) return;
-    if (!trackRef.current) return;
+  // 子要素（削除ボタン、既存バンド）を触ったら新規作成しない
+  if (e.currentTarget !== e.target) return;
+  if (!trackRef.current) return;
 
-    const rect = trackRef.current.getBoundingClientRect();
-    const y = e.clientY - rect.top + trackRef.current.scrollTop;
+  const rect = trackRef.current.getBoundingClientRect();
+  const y = e.clientY - rect.top + trackRef.current.scrollTop;
 
-    // ダウン情報を記録。ここでは pointer capture は取らない（スクロールを邪魔しないため）
-    gesture.current = {
-      downY: y,
-      downTime: Date.now(),
-      scrollTop: trackRef.current.scrollTop,
-      moved: false,
-    };
-
-    // 「タップ→伸ばす」にしたいので、いったんアンカー（開始時刻）を先に覚えておく
-    const startMin = yToMinute(y);
-    setAnchorStart(startMin);
+  // スクロール検出のために初期値を記録（この時点では pointer capture は取らない）
+  gesture.current = {
+    downY: y,
+    downTime: Date.now(),
+    scrollTop: trackRef.current.scrollTop,
   };
+
+  // ★ タップ直後に開始点を確定＆30分の仮レンジを見せる（“タップできない”を解消）
+  const startMin = yToMinute(y);
+  setAnchorStart(startMin);
+  setDragging({ mode: "new", startY: y, startMin, endMin: startMin + STEP });
+  setHoverRange({ start: startMin, end: startMin + STEP });
+};
+
 
   const onTrackPointerMove: React.PointerEventHandler<HTMLDivElement> = (e) => {
-    if (!trackRef.current) return;
+  if (!trackRef.current) return;
 
-    // スクロールを検出：スクロール量がしきい値を超えたら “選択操作” はキャンセル
-    if (gesture.current) {
-      const scrolled = Math.abs(trackRef.current.scrollTop - gesture.current.scrollTop) > SCROLL_THRESHOLD_PX;
-      if (scrolled) {
-        gesture.current = null;           // スクロール中 → 選択はしない
-        setHoverRange(null);
-        return;
-      }
-    }
-
-    // まだドラッグ開始していない場合、移動量で「ドラッグ開始」か判定
-    if (gesture.current && anchorStart !== null && !dragging) {
-      const rect = trackRef.current.getBoundingClientRect();
-      const y = e.clientY - rect.top + trackRef.current.scrollTop;
-      const dy = Math.abs(y - gesture.current.downY);
-
-      // 十分動いたら「伸ばし開始」＝新規作成ドラッグに切り替える
-      if (dy > MOVE_THRESHOLD_PX) {
-        (e.target as HTMLElement).setPointerCapture(e.pointerId); // ここで初めて capture を取る
-        const start = anchorStart;
-        const end = yToMinute(y);
-        const s = Math.min(start, end);
-        const t = Math.max(start + STEP, end); // 最低30分
-        setDragging({ mode: "new", startY: gesture.current.downY, startMin: start, endMin: end });
-        setHoverRange({ start: clamp(s, 0, 1410), end: clamp(t, 30, 1440) });
-        gesture.current.moved = true;
-        return;
-      }
-    }
-
-    // 既にドラッグ中なら、ぐいーん更新
-    if (dragging) {
-      const rect = trackRef.current.getBoundingClientRect();
-      const y = e.clientY - rect.top + trackRef.current.scrollTop;
-      const dy = y - dragging.startY;
-
-      if (dragging.mode === "new") {
-        const end = clamp(floorTo30(dragging.startMin + yToMinute(dy)), 0, 1440);
-        const s = Math.min(dragging.startMin, end);
-        const t = Math.max(dragging.startMin + STEP, end);
-        setHoverRange({ start: clamp(s, 0, 1410), end: clamp(t, 30, 1440) });
-      } else if (dragging.mode === "resize-start") {
-        const newStart = clamp(floorTo30(dragging.startMin + yToMinute(dy)), 0, dragging.endMin - STEP);
-        setHoverRange({ start: newStart, end: dragging.endMin });
-      } else if (dragging.mode === "resize-end") {
-        const newEnd = clamp(floorTo30(dragging.endMin + yToMinute(dy)), dragging.startMin + STEP, 1440);
-        setHoverRange({ start: dragging.startMin, end: newEnd });
-      }
-    }
-  };
-
-  const onTrackPointerUp: React.PointerEventHandler<HTMLDivElement> = () => {
-    // タップ判定だけで終わった場合（＝スクロールじゃないが引き伸ばしもしなかった）
-    // → 何も確定しない（アンカー保持のまま次操作へ）
-    if (!dragging) {
+  // スクロール検出：scrollTop変化がしきい値超なら“スクロール扱い”でキャンセル
+  if (gesture.current) {
+    const scrolled = Math.abs(trackRef.current.scrollTop - gesture.current.scrollTop) > SCROLL_THRESHOLD_PX;
+    if (scrolled) {
       gesture.current = null;
+      setDragging(null);
       setHoverRange(null);
       return;
     }
+  }
 
-    // ドラッグで新規 or リサイズを確定
-    if (hoverRange) {
-      if (dragging.mode === "new") {
-        addOrMergeSlot(activeDateISO, hoverRange.start, hoverRange.end);
-      } else if (dragging.slotId) {
-        setSlots((prev) =>
-          prev.map((s) => (s.id === dragging.slotId ? { ...s, start: hoverRange.start, end: hoverRange.end } : s))
-        );
-      }
-    }
+  if (!dragging) return;
 
-    setDragging(null);
-    setHoverRange(null);
+  const rect = trackRef.current.getBoundingClientRect();
+  const y = e.clientY - rect.top + trackRef.current.scrollTop;
+
+  // タップ位置から十分動いたら、ここで初めて pointer capture を取って“伸ばし”に移行
+  if ((e as any).pointerId && Math.abs(y - (gesture.current?.downY ?? y)) > MOVE_THRESHOLD_PX) {
+    try {
+      (e.target as HTMLElement).setPointerCapture((e as any).pointerId);
+    } catch {}
+  }
+
+  if (dragging.mode === "new") {
+    const end = clamp(floorTo30(yToMinute(y)), 0, 1440);
+    const s = Math.min(dragging.startMin, end);
+    const t = Math.max(dragging.startMin + STEP, end); // 最低30分
+    setHoverRange({ start: clamp(s, 0, 1410), end: clamp(t, 30, 1440) });
+  } else if (dragging.mode === "resize-start") {
+    const dy = y - dragging.startY;
+    const newStart = clamp(floorTo30(dragging.startMin + yToMinute(dy)), 0, dragging.endMin - STEP);
+    setHoverRange({ start: newStart, end: dragging.endMin });
+  } else if (dragging.mode === "resize-end") {
+    const dy = y - dragging.startY;
+    const newEnd = clamp(floorTo30(dragging.endMin + yToMinute(dy)), dragging.startMin + STEP, 1440);
+    setHoverRange({ start: dragging.startMin, end: newEnd });
+  }
+};
+
+  const onTrackPointerUp: React.PointerEventHandler<HTMLDivElement> = () => {
+  // スクロール認定されていたら何もしない
+  if (!dragging) {
     gesture.current = null;
-  };
+    setHoverRange(null);
+    return;
+  }
+
+  if (hoverRange) {
+    if (dragging.mode === "new") {
+      // ★ タップ→離す だけでも 30分枠を確定（“タップで選べない”を解消）
+      addOrMergeSlot(activeDateISO, hoverRange.start, hoverRange.end);
+    } else if (dragging.slotId) {
+      setSlots((prev) =>
+        prev.map((s) => (s.id === dragging.slotId ? { ...s, start: hoverRange.start, end: hoverRange.end } : s))
+      );
+    }
+  }
+
+  setDragging(null);
+  setHoverRange(null);
+  gesture.current = null;
+};
 
   // === 出力テキスト ===
   const selectedSlotsSorted = useMemo(
@@ -335,6 +336,16 @@ export default function App() {
       <div className="mx-auto max-w-md p-4">
         <h1 className="text-2xl font-bold mb-3">アポイント候補メーカー</h1>
 
+       {/* 一時デバッグ表示トグル（公開時は消してOK） */}
+<div className="flex justify-end mb-2">
+  <button
+    className="px-2 py-1 text-xs border rounded bg-yellow-50 hover:bg-yellow-100"
+    onClick={() => setShowDebug((v) => !v)}
+  >
+    デバッグ表示: {showDebug ? "ON" : "OFF"}
+  </button>
+</div>
+
         {/* === カレンダー === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
           <div className="flex items-center justify-between mb-2">
@@ -370,6 +381,15 @@ export default function App() {
         {/* === 時間トラック === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
           <div
+            {showDebug && (
+  <div className="absolute z-10 right-2 top-2 text-[11px] bg-yellow-100 border border-yellow-300 rounded px-2 py-1 shadow">
+    <div>修正：タップで開始 → 伸ばすで調整</div>
+    <div>開始: {anchorStart != null ? mm(anchorStart) : "-"}</div>
+    <div>状態: {dragging ? dragging.mode : "none"}</div>
+    <div>選択: {hoverRange ? `${mm(hoverRange.start)}〜${mm(hoverRange.end)}` : "-"}</div>
+  </div>
+)}
+
             ref={trackRef}
             className="relative h-[420px] overflow-auto border rounded-lg bg-[linear-gradient(#f8fafc_23px,transparent_24px)] [background-size:100%_24px]"
             onPointerDown={onTrackPointerDown}
