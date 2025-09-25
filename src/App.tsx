@@ -61,6 +61,16 @@ export default function App() {
   >(null);
   const [hoverRange, setHoverRange] = useState<{ start: number; end: number } | null>(null);
 
+// --- タップ→伸ばす用のアンカー & ジェスチャ判定 ---
+const [anchorStart, setAnchorStart] = useState<number | null>(null);
+/** ポインタダウン時の一時情報（スクロール判定に使う） */
+const gesture = useRef<{ downY: number; downTime: number; scrollTop: number; moved: boolean } | null>(null);
+
+// 判定しきい値（必要に応じて微調整）
+const TAP_MAX_DURATION_MS = 200;    // 200ms以内の短押しを「タップ」とみなす
+const MOVE_THRESHOLD_PX = 8;        // これ以上動いたら「ドラッグ/スクロール」
+const SCROLL_THRESHOLD_PX = 2;      // スクロール量がこれを超えたら「スクロール」
+
   // ==== タイムトラック描画パラメータ ====
   const MINUTES_PER_DAY = 24 * 60;
   const STEP = 30;
@@ -134,40 +144,62 @@ export default function App() {
   const LONG_PRESS_MS = 200;
   const MOVE_CANCEL_PX = 8;
 
-  const onTrackPointerDown: React.PointerEventHandler<HTMLDivElement> = (e) => {
-    // 子要素（ボタンやバンド）を触ったら新規作成しない
-    if (e.currentTarget !== e.target) return;
-    if (!trackRef.current) return;
+ const onTrackPointerDown: React.PointerEventHandler<HTMLDivElement> = (e) => {
+  // 子要素（削除ボタン等）を触ったら、新規作成/ドラッグを開始しない
+  if (e.currentTarget !== e.target) return;
+  if (!trackRef.current) return;
 
-    const rect = trackRef.current.getBoundingClientRect();
-    const y = e.clientY - rect.top + trackRef.current.scrollTop;
-    pressInfo.current = { timer: null, startY: y, activated: false };
+  const rect = trackRef.current.getBoundingClientRect();
+  const y = e.clientY - rect.top + trackRef.current.scrollTop;
 
-    // long-press で作成開始
-    const t = window.setTimeout(() => {
-      if (!pressInfo.current) return;
-      const snapped = yToMinute(pressInfo.current.startY);
-      (e.target as HTMLElement).setPointerCapture(e.pointerId);
-      setDragging({ mode: "new", startY: pressInfo.current.startY, startMin: snapped, endMin: snapped + STEP });
-      setHoverRange({ start: snapped, end: snapped + STEP });
-      pressInfo.current.activated = true;
-    }, LONG_PRESS_MS);
-    pressInfo.current.timer = t;
+  // ダウン情報を記録。ここでは pointer capture は取らない（スクロールを邪魔しないため）
+  gesture.current = {
+    downY: y,
+    downTime: Date.now(),
+    scrollTop: trackRef.current.scrollTop,
+    moved: false,
   };
 
-  const onTrackPointerMove: React.PointerEventHandler<HTMLDivElement> = (e) => {
-    if (pressInfo.current && !pressInfo.current.activated) {
-      // long-press 前に大きく動いたらスクロール扱い（キャンセル）
-      const rect = trackRef.current!.getBoundingClientRect();
-      const y = e.clientY - rect.top + (trackRef.current!.scrollTop);
-      if (Math.abs(y - pressInfo.current.startY) > MOVE_CANCEL_PX) {
-        if (pressInfo.current.timer) window.clearTimeout(pressInfo.current.timer);
-        pressInfo.current = null;
-      }
+  // 「タップ→伸ばす」にしたいので、いったんアンカー（開始時刻）を先に覚えておく
+  const startMin = yToMinute(y);
+  setAnchorStart(startMin);
+};
+
+ const onTrackPointerMove: React.PointerEventHandler<HTMLDivElement> = (e) => {
+  if (!trackRef.current) return;
+
+  // スクロールを検出：スクロール量がしきい値を超えたら “選択操作” はキャンセル
+  if (gesture.current) {
+    const scrolled = Math.abs(trackRef.current.scrollTop - gesture.current.scrollTop) > SCROLL_THRESHOLD_PX;
+    if (scrolled) {
+      gesture.current = null;           // スクロール中 → 選択はしない
+      setHoverRange(null);
       return;
     }
+  }
 
-    if (!dragging || !trackRef.current) return;
+  // まだドラッグ開始していない場合、移動量で「ドラッグ開始」か判定
+  if (gesture.current && anchorStart !== null && !dragging) {
+    const rect = trackRef.current.getBoundingClientRect();
+    const y = e.clientY - rect.top + trackRef.current.scrollTop;
+    const dy = Math.abs(y - gesture.current.downY);
+
+    // 十分動いたら「伸ばし開始」＝新規作成ドラッグに切り替える
+    if (dy > MOVE_THRESHOLD_PX) {
+      (e.target as HTMLElement).setPointerCapture(e.pointerId); // ここで初めて capture を取る
+      const start = anchorStart;
+      const end = yToMinute(y);
+      const s = Math.min(start, end);
+      const t = Math.max(start + STEP, end); // 最低30分
+      setDragging({ mode: "new", startY: gesture.current.downY, startMin: start, endMin: end });
+      setHoverRange({ start: clamp(s, 0, 1410), end: clamp(t, 30, 1440) });
+      gesture.current.moved = true;
+      return;
+    }
+  }
+
+  // 既にドラッグ中なら、ぐいーん更新
+  if (dragging) {
     const rect = trackRef.current.getBoundingClientRect();
     const y = e.clientY - rect.top + trackRef.current.scrollTop;
     const dy = y - dragging.startY;
@@ -184,29 +216,33 @@ export default function App() {
       const newEnd = clamp(floorTo30(dragging.endMin + yToMinute(dy)), dragging.startMin + STEP, 1440);
       setHoverRange({ start: dragging.startMin, end: newEnd });
     }
-  };
+  }
+};
 
   const onTrackPointerUp: React.PointerEventHandler<HTMLDivElement> = () => {
-    if (pressInfo.current) {
-      if (pressInfo.current.timer) window.clearTimeout(pressInfo.current.timer);
-      pressInfo.current = null;
-    }
-    if (!dragging || !hoverRange) {
-      setDragging(null);
-      setHoverRange(null);
-      return;
-    }
+  // タップ判定だけで終わった場合（＝スクロールじゃないが引き伸ばしもしなかった）
+  // → 何も確定しない（アンカー保持のまま次操作へ）
+  if (!dragging) {
+    gesture.current = null;
+    setHoverRange(null);
+    return;
+  }
+
+  // ドラッグで新規 or リサイズを確定
+  if (hoverRange) {
     if (dragging.mode === "new") {
       addOrMergeSlot(activeDateISO, hoverRange.start, hoverRange.end);
     } else if (dragging.slotId) {
-      // 既存枠のサイズ変更
       setSlots((prev) =>
         prev.map((s) => (s.id === dragging.slotId ? { ...s, start: hoverRange.start, end: hoverRange.end } : s))
       );
     }
-    setDragging(null);
-    setHoverRange(null);
-  };
+  }
+
+  setDragging(null);
+  setHoverRange(null);
+  gesture.current = null;
+};
 
   // === 出力テキスト ===
   const selectedSlotsSorted = useMemo(
