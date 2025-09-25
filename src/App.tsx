@@ -144,7 +144,6 @@ export default function App() {
   // === タップ→伸ばす：ハンドラ ===
   const onTrackPointerDown: React.PointerEventHandler<HTMLDivElement> = (e) => {
     // 子要素（削除ボタン、既存バンド）を触ったら新規作成しない
-    if (e.currentTarget !== e.target) return;
     if (!trackRef.current) return;
 
     const rect = trackRef.current.getBoundingClientRect();
@@ -408,8 +407,9 @@ export default function App() {
                   key={s.id}
                   className="absolute left-10 right-3 rounded-lg bg-teal-500/25 border border-teal-500"
                   style={{ top, height }}
+                  onPointerDown={(e) => e.stopPropagation()}
                 >
-                  {/* ハンドル（上下4px） */}
+                  {/* 上下ハンドル・表示・削除ボタン… */}
                   <div
                     className="absolute top-0 left-0 right-0 h-1 bg-teal-500/60 cursor-[ns-resize]"
                     onPointerDown={(e) => {
