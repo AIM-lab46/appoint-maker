@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
+/** ====== 型 ====== */
 type Slot = {
   id: string;
   dateISO: string; // "2025-09-25"
@@ -7,6 +8,13 @@ type Slot = {
   end: number;     // minutes 0..1440 (start < end)
 };
 
+type Tpl = {
+  id: string;         // 固定ID "tpl-1" | "tpl-2" | "tpl-3"
+  name: string;       // テンプレ名（タブ表示）
+  content: string;    // 本文（{{宛先名}} / {{候補一覧}}）
+};
+
+/** ====== ユーティリティ ====== */
 const toISODate = (d: Date) => d.toISOString().slice(0, 10);
 const pad = (n: number) => (n < 10 ? `0${n}` : `${n}`);
 const mm = (m: number) => `${pad((m / 60) | 0)}:${pad(m % 60)}`;
@@ -14,46 +22,101 @@ const floorTo15 = (m: number) => Math.floor(m / 15) * 15;
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
 const weekdayMonStart = (jsDay: number) => (jsDay + 6) % 7;
 
-// 振動フィードバック（対応端末のみ）
+// 端末がバイブ対応なら軽く振動
 const vibrate = (duration: number = 10) => {
-  if ('vibrate' in navigator) {
-    navigator.vibrate(duration);
-  }
+  if ("vibrate" in navigator) (navigator as any).vibrate(duration);
 };
 
-const defaultTemplate =
+// localStorageの安全版（使えなければ useState にフォールバック）
+function useSafeLocalStorage<T>(key: string, initial: T) {
+  const storageOK = useMemo(() => {
+    try {
+      const k = "__am_probe__";
+      localStorage.setItem(k, "1");
+      localStorage.removeItem(k);
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const [value, setValue] = useState<T>(() => {
+    if (!storageOK) return initial;
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? (JSON.parse(raw) as T) : initial;
+    } catch {
+      return initial;
+    }
+  });
+
+  useEffect(() => {
+    if (!storageOK) return;
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch {}
+  }, [key, value, storageOK]);
+
+  return [value, setValue] as const;
+}
+
+/** ====== デフォルトテンプレ ====== */
+const tpl1 =
   `{{宛先名}} 様\n\n以下の日程のいずれかでご都合いかがでしょうか？\n\n{{候補一覧}}\n` +
   `上記日時でもしご都合が合わない際は再度調整いたしますので、ご一報いただけますと幸いです。\n何卒宜しくお願いいたします。`;
 
+const defaultTemplates: Tpl[] = [
+  { id: "tpl-1", name: "はじめまして用", content: tpl1 },
+  { id: "tpl-2", name: "対面商談用", content: "" },
+  { id: "tpl-3", name: "オンライン用", content: "" },
+];
+
+/** ====== 本体 ====== */
 export default function App() {
+  /** ▼ URLの uid で保存領域を分離（?uid=xxxx） */
+  const uid = useMemo(() => {
+    try {
+      const p = new URLSearchParams(window.location.search);
+      return p.get("uid") || "default";
+    } catch {
+      return "default";
+    }
+  }, []);
+  const ns = (k: string) => `am_${k}_${uid}`;
+
   // 今日 & カレンダー表示年月
   const today = useMemo(() => new Date(), []);
-  const [year, setYear] = useState(today.getFullYear());
-  const [month, setMonth] = useState(today.getMonth());
-  const [activeDateISO, setActiveDateISO] = useState<string>(toISODate(today));
+  const [year, setYear] = useSafeLocalStorage<number>(ns("year"), today.getFullYear());
+  const [month, setMonth] = useSafeLocalStorage<number>(ns("month"), today.getMonth());
+  const [activeDateISO, setActiveDateISO] = useSafeLocalStorage<string>(ns("activeDate"), toISODate(today));
 
-  // データ（localStorage使用不可のため通常のstate）
-  const [slots, setSlots] = useState<Slot[]>([]);
-  const [template, setTemplate] = useState<string>(defaultTemplate);
-  const [toName, setToName] = useState<string>("");
+  // データ（保存）
+  const [slots, setSlots] = useSafeLocalStorage<Slot[]>(ns("slots"), []);
+  const [templates, setTemplates] = useSafeLocalStorage<Tpl[]>(ns("templates"), defaultTemplates);
+  const [activeTplId, setActiveTplId] = useSafeLocalStorage<string>(ns("activeTplId"), "tpl-1");
+  const [toName, setToName] = useSafeLocalStorage<string>(ns("toName"), "");
 
   // タイムトラック
   const trackRef = useRef<HTMLDivElement | null>(null);
 
   // リサイズ用ドラッグ状態
-  const [dragging, setDragging] = useState<{
-    mode: "resize-start" | "resize-end";
-    slotId: string;
-    originalSlot: Slot;
-    currentStart: number;
-    currentEnd: number;
-  } | null>(null);
+  const [dragging, setDragging] = useState<
+    | null
+    | {
+        mode: "resize-start" | "resize-end";
+        startY: number;   // トラック相対Y(px)
+        startMin: number; // 開始時の開始分
+        endMin: number;   // 開始時の終了分
+        slotId: string;
+      }
+  >(null);
+  const [hoverRange, setHoverRange] = useState<{ start: number; end: number } | null>(null);
 
   // ==== タイムトラック描画パラメータ ====
   const MINUTES_PER_DAY = 24 * 60;
-  const STEP = 15; // 15分単位
+  const STEP = 15;              // 15分刻み（表示とスナップ）
   const ROWS = MINUTES_PER_DAY / STEP; // 96
-  const ROW_HEIGHT = 12; // px (より細かく)
+  const ROW_HEIGHT = 12;        // px
   const TRACK_HEIGHT = ROWS * ROW_HEIGHT;
   const minuteToY = (m: number) => (m / STEP) * ROW_HEIGHT;
   const yToMinute = (y: number) => clamp(floorTo15((y / ROW_HEIGHT) * STEP), 0, 1440);
@@ -72,32 +135,28 @@ export default function App() {
     return arr;
   }, [year, month, leadingBlanks, daysInMonth]);
 
-  // 当日枠（ドラッグ中は除く）
-  const daySlots = useMemo(() => {
-    const base = slots.filter((s) => s.dateISO === activeDateISO);
-    if (dragging && dragging.originalSlot.dateISO === activeDateISO) {
-      // ドラッグ中のスロットを除外
-      return base.filter(s => s.id !== dragging.slotId).sort((a, b) => a.start - b.start);
-    }
-    return base.sort((a, b) => a.start - b.start);
-  }, [slots, activeDateISO, dragging]);
+  // 当日枠
+  const daySlots = useMemo(
+    () => slots.filter((s) => s.dateISO === activeDateISO).sort((a, b) => a.start - b.start),
+    [slots, activeDateISO]
+  );
 
   // === 追加・マージ・重複排除ロジック ===
-  function addOrMergeSlot(dateISO: string, start: number, end: number, excludeId?: string) {
-    start = clamp(start, 0, 1425); // 23:45まで
-    end = clamp(end, 15, 1440); // 24:00まで
+  function addOrMergeSlot(dateISO: string, start: number, end: number) {
+    start = clamp(start, 0, 1440 - STEP);
+    end = clamp(end, STEP, 1440);
     if (end - start < 30) end = Math.min(start + 30, 1440); // 最小30分
     if (start >= end) return;
 
     setSlots((prev) => {
-      // excludeIdがある場合はそれを除外（リサイズ時）
-      let filtered = excludeId ? prev.filter(p => p.id !== excludeId) : prev;
+      // 完全重複は無視
+      if (prev.some((p) => p.dateISO === dateISO && p.start === start && p.end === end)) return prev;
 
       // 同日で重なり or 端が接しているものはマージ
       let mergedStart = start;
       let mergedEnd = end;
       const rest: Slot[] = [];
-      for (const p of filtered) {
+      for (const p of prev) {
         if (p.dateISO !== dateISO) {
           rest.push(p);
           continue;
@@ -107,29 +166,23 @@ export default function App() {
         if (overlap || touching) {
           mergedStart = Math.min(mergedStart, p.start);
           mergedEnd = Math.max(mergedEnd, p.end);
-          vibrate(5); // マージ時に軽い振動
+          vibrate(5);
         } else {
           rest.push(p);
         }
       }
-      const newId = excludeId || crypto.randomUUID();
       return [
         ...rest,
-        { id: newId, dateISO, start: mergedStart, end: mergedEnd },
+        { id: crypto.randomUUID(), dateISO, start: mergedStart, end: mergedEnd },
       ].sort((a, b) =>
         a.dateISO === b.dateISO ? a.start - b.start : a.dateISO.localeCompare(b.dateISO)
       );
     });
   }
-
   const removeSlot = (id: string) => setSlots((prev) => prev.filter((s) => s.id !== id));
 
-  // === 「スクロール優先 / 登録は長押しのみ」のジェスチャ ===
-  const gesture = useRef<{
-    downY: number;
-    scrollTop: number;
-    timer?: number;
-  } | null>(null);
+  /** === 「スクロール優先 / 登録は長押しのみ」 === */
+  const gesture = useRef<{ downY: number; scrollTop: number; timer?: number } | null>(null);
   const LONG_PRESS_MS = 300;
   const MOVE_THRESHOLD_PX = 8;
   const SCROLL_THRESHOLD_PX = 3;
@@ -147,9 +200,8 @@ export default function App() {
       if (!trackRef.current || !gesture.current) return;
       const scrolled = Math.abs(trackRef.current.scrollTop - gesture.current.scrollTop) > SCROLL_THRESHOLD_PX;
       if (scrolled) return;
-      // 長押し成立 → 30分枠を追加
       addOrMergeSlot(activeDateISO, startMin, startMin + 30);
-      vibrate(20); // 作成時の振動
+      vibrate(20);
     }, LONG_PRESS_MS);
     gesture.current.timer = t;
   };
@@ -157,14 +209,12 @@ export default function App() {
   const onTrackPointerMove: React.PointerEventHandler<HTMLDivElement> = (e) => {
     if (!trackRef.current) return;
     if (!gesture.current) return;
-
     const scrolled = Math.abs(trackRef.current.scrollTop - gesture.current.scrollTop) > SCROLL_THRESHOLD_PX;
     if (scrolled) {
       if (gesture.current.timer) window.clearTimeout(gesture.current.timer);
       gesture.current = null;
       return;
     }
-
     const rect = trackRef.current.getBoundingClientRect();
     const yRel = e.clientY - rect.top + trackRef.current.scrollTop;
     if (Math.abs(yRel - gesture.current.downY) > MOVE_THRESHOLD_PX) {
@@ -178,63 +228,79 @@ export default function App() {
     gesture.current = null;
   };
 
-  // === グローバルポインターイベント（リサイズ処理）===
-  useEffect(() => {
+  /** === リサイズ（上下ハンドル） === */
+  const onHandleDown = (
+    e: React.PointerEvent<HTMLDivElement>,
+    mode: "resize-start" | "resize-end",
+    slot: Slot
+  ) => {
+    e.stopPropagation();
+    if (!trackRef.current) return;
+    const rect = trackRef.current.getBoundingClientRect();
+    const yRel = e.clientY - rect.top + trackRef.current.scrollTop;
+    try { (e.target as HTMLElement).setPointerCapture((e as any).pointerId); } catch {}
+    setDragging({ mode, startY: yRel, startMin: slot.start, endMin: slot.end, slotId: slot.id });
+    setHoverRange({ start: slot.start, end: slot.end });
+    vibrate(8);
+  };
+
+  const onDocPointerMove = (e: PointerEvent) => {
+    if (!dragging || !trackRef.current) return;
+    const rect = trackRef.current.getBoundingClientRect();
+    const yRel = e.clientY - rect.top + trackRef.current.scrollTop;
+    const dyMin = yToMinute(yRel) - yToMinute(dragging.startY);
+
+    if (dragging.mode === "resize-start") {
+      const ns = clamp(floorTo15(dragging.startMin + dyMin), 0, dragging.endMin - 30);
+      setHoverRange({ start: ns, end: dragging.endMin });
+    } else {
+      const ne = clamp(floorTo15(dragging.endMin + dyMin), dragging.startMin + 30, 1440);
+      setHoverRange({ start: dragging.startMin, end: ne });
+    }
+  };
+
+  const onDocPointerUp = () => {
     if (!dragging) return;
-
-    const handlePointerMove = (e: PointerEvent) => {
-      if (!trackRef.current || !dragging) return;
-      const rect = trackRef.current.getBoundingClientRect();
-      const yRel = e.clientY - rect.top + trackRef.current.scrollTop;
-      const targetMin = yToMinute(yRel);
-
-      let newStart = dragging.originalSlot.start;
-      let newEnd = dragging.originalSlot.end;
-
-      if (dragging.mode === "resize-start") {
-        newStart = Math.min(targetMin, dragging.originalSlot.end - 30);
-        newStart = clamp(newStart, 0, 1425);
-      } else {
-        newEnd = Math.max(targetMin, dragging.originalSlot.start + 30);
-        newEnd = clamp(newEnd, 30, 1440);
-      }
-
-      // 15分単位でスナップしたときに振動
-      if (targetMin % 15 === 0 && (targetMin !== dragging.currentStart && targetMin !== dragging.currentEnd)) {
-        vibrate(3);
-      }
-
-      setDragging(prev => prev ? {
-        ...prev,
-        currentStart: newStart,
-        currentEnd: newEnd
-      } : null);
-    };
-
-    const handlePointerUp = () => {
-      if (dragging) {
-        // リサイズ完了時に新しい枠を作成（マージも自動実行）
-        addOrMergeSlot(
-          dragging.originalSlot.dateISO,
-          dragging.currentStart,
-          dragging.currentEnd,
-          dragging.slotId
+    if (hoverRange) {
+      // dragging.slotId を置き換え（=リサイズ確定 & マージ）
+      setSlots((prev) => {
+        const rest = prev.filter((p) => p.id !== dragging.slotId);
+        const dateISO = prev.find((p) => p.id === dragging.slotId)?.dateISO || activeDateISO;
+        // まず既存とマージ
+        let start = hoverRange.start;
+        let end = hoverRange.end;
+        const sameDay = rest.filter((p) => p.dateISO === dateISO);
+        for (const p of sameDay) {
+          const overlap = !(p.end <= start || end <= p.start);
+          const touching = p.end === start || end === p.start;
+          if (overlap || touching) {
+            start = Math.min(start, p.start);
+            end = Math.max(end, p.end);
+          }
+        }
+        const mergedId = crypto.randomUUID();
+        const merged: Slot = { id: mergedId, dateISO, start, end };
+        return [...rest, merged].sort((a, b) =>
+          a.dateISO === b.dateISO ? a.start - b.start : a.dateISO.localeCompare(b.dateISO)
         );
-        vibrate(10); // 確定時の振動
-        setDragging(null);
-      }
-    };
+      });
+    }
+    setDragging(null);
+    setHoverRange(null);
+    vibrate(10);
+  };
 
-    document.addEventListener("pointermove", handlePointerMove);
-    document.addEventListener("pointerup", handlePointerUp);
-
+  useEffect(() => {
+    document.addEventListener("pointermove", onDocPointerMove);
+    document.addEventListener("pointerup", onDocPointerUp);
     return () => {
-      document.removeEventListener("pointermove", handlePointerMove);
-      document.removeEventListener("pointerup", handlePointerUp);
+      document.removeEventListener("pointermove", onDocPointerMove);
+      document.removeEventListener("pointerup", onDocPointerUp);
     };
-  }, [dragging]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dragging, hoverRange, activeDateISO]);
 
-  // === 出力テキスト ===
+  /** === 出力テキスト === */
   const selectedSlotsSorted = useMemo(
     () =>
       [...slots].sort((a, b) =>
@@ -262,10 +328,12 @@ export default function App() {
     return lines.join("\n");
   }, [selectedSlotsSorted]);
 
+  const activeTpl = useMemo(() => templates.find(t => t.id === activeTplId) || templates[0], [templates, activeTplId]);
   const outputText = useMemo(() => {
     const name = toName.trim() || "（宛先名）";
-    return template.split("{{宛先名}}").join(name).split("{{候補一覧}}").join(candidateListText);
-  }, [template, toName, candidateListText]);
+    const tpl = activeTpl?.content || "";
+    return tpl.split("{{宛先名}}").join(name).split("{{候補一覧}}").join(candidateListText);
+  }, [activeTpl, toName, candidateListText]);
 
   const copy = async () => {
     try {
@@ -276,6 +344,7 @@ export default function App() {
     }
   };
 
+  /** === カレンダー操作 === */
   const prevMonth = () => {
     const d = new Date(year, month - 1, 1);
     setYear(d.getFullYear());
@@ -289,7 +358,7 @@ export default function App() {
 
   const weekdayClasses = ["", "", "", "", "", "text-blue-600", "text-red-600"];
 
-  // 候補一覧（削除つき表示）
+  /** === 候補一覧（削除つき） === */
   function renderGroupedListWithRemove() {
     const grouped: Record<string, Slot[]> = {};
     selectedSlotsSorted.forEach((s) => ((grouped[s.dateISO] ??= []).push(s)));
@@ -324,10 +393,21 @@ export default function App() {
     );
   }
 
+  /** === テンプレUI（3枠・保存） === */
+  const renameTemplate = (id: string, name: string) =>
+    setTemplates(prev => prev.map(t => t.id === id ? { ...t, name } : t));
+  const updateTemplateContent = (id: string, content: string) =>
+    setTemplates(prev => prev.map(t => t.id === id ? { ...t, content } : t));
+  const resetTemplate = (id: string) =>
+    setTemplates(prev => prev.map(t => t.id === id ? { ...t, content: "" } : t));
+
   return (
     <div className="min-h-screen bg-gray-50">
       <div className="mx-auto max-w-md p-4">
-        <h1 className="text-2xl font-bold mb-3">アポイント候補メーカー</h1>
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold mb-3">アポイント候補メーカー</h1>
+          <div className="text-[11px] text-gray-500">UID: <span className="font-mono">{uid}</span></div>
+        </div>
 
         {/* === カレンダー === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
@@ -361,7 +441,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* === 時間トラック === */}
+        {/* === 時間トラック（長押し→30分枠 / ハンドルでリサイズ） === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
           <div className="text-sm font-medium mb-2">{activeDateISO} の時間選択</div>
           <div className="text-xs text-gray-500 mb-2">長押しで30分枠作成 → 上下の端をドラッグで調整</div>
@@ -369,8 +449,8 @@ export default function App() {
             ref={trackRef}
             className="relative h-[420px] overflow-auto border rounded-lg select-none"
             style={{
-              background: `linear-gradient(#f8fafc ${ROW_HEIGHT - 1}px, transparent 1px)`,
-              backgroundSize: `100% ${ROW_HEIGHT}px`
+              background: `linear-gradient(#f8fafc ${12 - 1}px, transparent 1px)`,
+              backgroundSize: `100% 12px`
             }}
             onPointerDown={onTrackPointerDown}
             onPointerMove={onTrackPointerMove}
@@ -395,46 +475,27 @@ export default function App() {
             {daySlots.map((s) => {
               const top = minuteToY(s.start);
               const height = minuteToY(s.end) - minuteToY(s.start);
+              const active = dragging?.slotId === s.id;
               return (
                 <div
                   key={s.id}
-                  className="absolute left-12 right-3 rounded-lg border bg-teal-500/20 border-teal-500"
+                  className={`absolute left-12 right-3 rounded-lg border select-none ${active ? "bg-teal-500/30 border-teal-700 shadow-md" : "bg-teal-500/20 border-teal-500"}`}
                   style={{ top, height }}
                   onPointerDown={(e) => e.stopPropagation()}
                 >
                   {/* 上ハンドル（10px） */}
                   <div
-                    className="absolute -top-[5px] left-0 right-0 h-[10px] bg-teal-600 rounded-t-md cursor-ns-resize touch-none active:bg-teal-700"
-                    style={{ boxShadow: '0 -2px 4px rgba(0,0,0,0.1)' }}
-                    onPointerDown={(e) => {
-                      e.stopPropagation();
-                      setDragging({
-                        mode: "resize-start",
-                        slotId: s.id,
-                        originalSlot: s,
-                        currentStart: s.start,
-                        currentEnd: s.end
-                      });
-                      vibrate(10);
-                    }}
+                    className={`absolute -top-[5px] left-0 right-0 h-[10px] bg-teal-600 rounded-t-md cursor-[ns-resize] touch-none ${active && dragging?.mode === "resize-start" ? "bg-teal-700" : ""}`}
+                    style={{ boxShadow: "0 -2px 4px rgba(0,0,0,0.1)" }}
+                    onPointerDown={(e) => onHandleDown(e, "resize-start", s)}
                   />
                   {/* 下ハンドル（10px） */}
                   <div
-                    className="absolute -bottom-[5px] left-0 right-0 h-[10px] bg-teal-600 rounded-b-md cursor-ns-resize touch-none active:bg-teal-700"
-                    style={{ boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }}
-                    onPointerDown={(e) => {
-                      e.stopPropagation();
-                      setDragging({
-                        mode: "resize-end",
-                        slotId: s.id,
-                        originalSlot: s,
-                        currentStart: s.start,
-                        currentEnd: s.end
-                      });
-                      vibrate(10);
-                    }}
+                    className={`absolute -bottom-[5px] left-0 right-0 h-[10px] bg-teal-600 rounded-b-md cursor-[ns-resize] touch-none ${active && dragging?.mode === "resize-end" ? "bg-teal-700" : ""}`}
+                    style={{ boxShadow: "0 2px 4px rgba(0,0,0,0.1)" }}
+                    onPointerDown={(e) => onHandleDown(e, "resize-end", s)}
                   />
-                  {/* バンドラベル */}
+                  {/* ラベル & 削除 */}
                   <div className="absolute inset-0 flex items-center justify-between px-2 py-1">
                     <div className="text-xs font-medium">{mm(s.start)}〜{mm(s.end)}</div>
                     <button
@@ -449,19 +510,14 @@ export default function App() {
               );
             })}
 
-            {/* ドラッグ中のプレビュー */}
-            {dragging && dragging.originalSlot.dateISO === activeDateISO && (
+            {/* リサイズ中プレビュー */}
+            {hoverRange && (
               <div
-                className="absolute left-12 right-3 rounded-lg border-2 border-dashed border-teal-700 bg-teal-300/40"
-                style={{
-                  top: minuteToY(dragging.currentStart),
-                  height: minuteToY(dragging.currentEnd) - minuteToY(dragging.currentStart)
-                }}
+                className="absolute left-12 right-3 rounded-lg border-2 border-dashed border-teal-700 bg-teal-300/40 pointer-events-none"
+                style={{ top: minuteToY(hoverRange.start), height: minuteToY(hoverRange.end) - minuteToY(hoverRange.start) }}
               >
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <div className="bg-white/95 px-3 py-1 rounded-md shadow-lg font-bold text-sm">
-                    {mm(dragging.currentStart)}〜{mm(dragging.currentEnd)}
-                  </div>
+                <div className="absolute right-2 top-1 text-xs font-semibold bg-white/80 px-1 rounded">
+                  {mm(hoverRange.start)}〜{mm(hoverRange.end)}
                 </div>
               </div>
             )}
@@ -474,7 +530,10 @@ export default function App() {
         <div className="bg-white rounded-xl shadow p-3 mb-4">
           <div className="text-sm font-medium mb-2">候補一覧（テキスト）</div>
           <pre className="text-sm p-2 bg-gray-50 rounded border overflow-auto whitespace-pre-wrap">
-{candidateListText}
+{(() => {
+  const txt = candidateListText;
+  return txt;
+})()}
           </pre>
         </div>
 
@@ -484,9 +543,9 @@ export default function App() {
           {renderGroupedListWithRemove()}
         </div>
 
-        {/* === テンプレ === */}
+        {/* === テンプレ（3枠・保存） === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
-          <div className="flex gap-2 mb-2">
+          <div className="flex gap-2 mb-2 items-center">
             <input
               className="flex-1 px-3 py-2 rounded border"
               placeholder="宛先名（例：○○様）"
@@ -495,25 +554,57 @@ export default function App() {
             />
             <button
               className="px-3 py-2 rounded bg-gray-100 border hover:bg-gray-200"
-              onClick={() => { setToName(""); setTemplate(defaultTemplate); }}
-              title="テンプレを初期化"
+              onClick={() => { setToName(""); setTemplates(defaultTemplates); setActiveTplId("tpl-1"); }}
+              title="全テンプレを初期化"
             >
               初期化
             </button>
           </div>
 
-          <label className="block text-sm font-medium mb-1">
-            テンプレ（{"{{宛先名}}"} / {"{{候補一覧}}"} を差し込み）
-          </label>
-          <textarea
-            className="w-full h-40 px-3 py-2 rounded border font-mono text-sm"
-            value={template}
-            onChange={(e) => setTemplate(e.target.value)}
+          {/* テンプレタブ */}
+          <div className="flex gap-2 mb-3">
+            {templates.map((t) => (
+              <button
+                key={t.id}
+                className={`px-3 py-1 rounded border text-sm ${activeTplId === t.id ? "bg-teal-600 text-white border-teal-700" : "bg-white border-gray-300 hover:bg-gray-50"}`}
+                onClick={() => setActiveTplId(t.id)}
+              >
+                {t.name || (t.id === "tpl-1" ? "はじめまして用" : t.id === "tpl-2" ? "対面商談用" : "オンライン用")}
+              </button>
+            ))}
+          </div>
+
+          {/* テンプレ名編集 */}
+          <label className="block text-xs text-gray-600 mb-1">テンプレ名（タブ表示用）</label>
+          <input
+            className="w-full px-3 py-2 rounded border mb-2"
+            value={activeTpl?.name || ""}
+            onChange={(e) => renameTemplate(activeTplId, e.target.value)}
           />
 
-          <div className="mt-3">
+          {/* 本文 */}
+          <label className="block text-sm font-medium mb-1">
+            テンプレ本文（{"{{宛先名}}"} / {"{{候補一覧}}"} を差し込み）
+          </label>
+          <textarea
+            className="w-full h-36 px-3 py-2 rounded border font-mono text-sm"
+            value={activeTpl?.content ?? ""}
+            onChange={(e) => updateTemplateContent(activeTplId, e.target.value)}
+          />
+          <div className="flex justify-between mt-2">
+            <div className="text-xs text-gray-500">※ 自動保存されています（この端末・このUID内）</div>
+            <button
+              className="px-3 py-1 rounded border bg-gray-50 hover:bg-gray-100 text-sm"
+              onClick={() => resetTemplate(activeTplId)}
+            >
+              このテンプレを空にする
+            </button>
+          </div>
+
+          {/* 出力 */}
+          <div className="mt-4">
             <label className="block text-sm font-medium mb-1">出力</label>
-            <textarea className="w-full h-48 px-3 py-2 rounded border font-mono text-sm" value={outputText} readOnly />
+            <textarea className="w-full h-40 px-3 py-2 rounded border font-mono text-sm" value={outputText} readOnly />
             <div className="mt-2 flex justify-end">
               <button onClick={copy} className="px-4 py-2 rounded bg-teal-600 text-white hover:bg-teal-700">
                 コピー
@@ -523,7 +614,7 @@ export default function App() {
         </div>
 
         <p className="text-xs text-gray-500">
-          ※データはこのセッション中のみ保持されます。ページをリロードするとリセットされます。
+          ※このツールはブラウザ保存です。同じURLでも <b>?uid=任意の文字</b> を付けると保存領域が分かれます（例：<span className="font-mono">?uid=a-san</span>）。
         </p>
       </div>
     </div>
