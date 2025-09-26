@@ -10,26 +10,16 @@ type Slot = {
 const toISODate = (d: Date) => d.toISOString().slice(0, 10);
 const pad = (n: number) => (n < 10 ? `0${n}` : `${n}`);
 const mm = (m: number) => `${pad((m / 60) | 0)}:${pad(m % 60)}`;
-const floorTo30 = (m: number) => Math.floor(m / 30) * 30;
+const floorTo15 = (m: number) => Math.floor(m / 15) * 15;
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
 const weekdayMonStart = (jsDay: number) => (jsDay + 6) % 7;
 
-function useLocalStorage<T>(key: string, initial: T) {
-  const [value, setValue] = useState<T>(() => {
-    try {
-      const raw = localStorage.getItem(key);
-      return raw ? (JSON.parse(raw) as T) : initial;
-    } catch {
-      return initial;
-    }
-  });
-  useEffect(() => {
-    try {
-      localStorage.setItem(key, JSON.stringify(value));
-    } catch {}
-  }, [key, value]);
-  return [value, setValue] as const;
-}
+// 振動フィードバック（対応端末のみ）
+const vibrate = (duration: number = 10) => {
+  if ('vibrate' in navigator) {
+    navigator.vibrate(duration);
+  }
+};
 
 const defaultTemplate =
   `{{宛先名}} 様\n\n以下の日程のいずれかでご都合いかがでしょうか？\n\n{{候補一覧}}\n` +
@@ -42,35 +32,31 @@ export default function App() {
   const [month, setMonth] = useState(today.getMonth());
   const [activeDateISO, setActiveDateISO] = useState<string>(toISODate(today));
 
-  // 保存データ
-  const [slots, setSlots] = useLocalStorage<Slot[]>("am_slots", []);
-  const [template, setTemplate] = useLocalStorage<string>("am_template", defaultTemplate);
-  const [toName, setToName] = useLocalStorage<string>("am_to_name", "");
+  // データ（localStorage使用不可のため通常のstate）
+  const [slots, setSlots] = useState<Slot[]>([]);
+  const [template, setTemplate] = useState<string>(defaultTemplate);
+  const [toName, setToName] = useState<string>("");
 
   // タイムトラック
   const trackRef = useRef<HTMLDivElement | null>(null);
 
   // リサイズ用ドラッグ状態
-  const [dragging, setDragging] = useState<
-    | null
-    | {
-        mode: "resize-start" | "resize-end";
-        startY: number;   // トラック相対Y(px)
-        startMin: number; // 開始時の開始分
-        endMin: number;   // 開始時の終了分
-        slotId: string;
-      }
-  >(null);
-  const [hoverRange, setHoverRange] = useState<{ start: number; end: number } | null>(null);
+  const [dragging, setDragging] = useState<{
+    mode: "resize-start" | "resize-end";
+    slotId: string;
+    originalSlot: Slot;
+    currentStart: number;
+    currentEnd: number;
+  } | null>(null);
 
   // ==== タイムトラック描画パラメータ ====
   const MINUTES_PER_DAY = 24 * 60;
-  const STEP = 30;
-  const ROWS = MINUTES_PER_DAY / STEP; // 48
-  const ROW_HEIGHT = 24;               // px
+  const STEP = 15; // 15分単位
+  const ROWS = MINUTES_PER_DAY / STEP; // 96
+  const ROW_HEIGHT = 12; // px (より細かく)
   const TRACK_HEIGHT = ROWS * ROW_HEIGHT;
   const minuteToY = (m: number) => (m / STEP) * ROW_HEIGHT;
-  const yToMinute = (y: number) => clamp(floorTo30((y / ROW_HEIGHT) * STEP), 0, 1440);
+  const yToMinute = (y: number) => clamp(floorTo15((y / ROW_HEIGHT) * STEP), 0, 1440);
 
   // === 月カレンダー計算（左:月曜〜右:日曜）===
   const firstOfMonth = useMemo(() => new Date(year, month, 1), [year, month]);
@@ -86,43 +72,50 @@ export default function App() {
     return arr;
   }, [year, month, leadingBlanks, daysInMonth]);
 
-  // 当日枠
-  const daySlots = useMemo(
-    () => slots.filter((s) => s.dateISO === activeDateISO).sort((a, b) => a.start - b.start),
-    [slots, activeDateISO]
-  );
+  // 当日枠（ドラッグ中は除く）
+  const daySlots = useMemo(() => {
+    const base = slots.filter((s) => s.dateISO === activeDateISO);
+    if (dragging && dragging.originalSlot.dateISO === activeDateISO) {
+      // ドラッグ中のスロットを除外
+      return base.filter(s => s.id !== dragging.slotId).sort((a, b) => a.start - b.start);
+    }
+    return base.sort((a, b) => a.start - b.start);
+  }, [slots, activeDateISO, dragging]);
 
   // === 追加・マージ・重複排除ロジック ===
-  function addOrMergeSlot(dateISO: string, start: number, end: number) {
-    start = clamp(start, 0, 1410);
-    end = clamp(end, 30, 1440);
+  function addOrMergeSlot(dateISO: string, start: number, end: number, excludeId?: string) {
+    start = clamp(start, 0, 1425); // 23:45まで
+    end = clamp(end, 15, 1440); // 24:00まで
+    if (end - start < 30) end = Math.min(start + 30, 1440); // 最小30分
     if (start >= end) return;
 
     setSlots((prev) => {
-      // 完全重複は無視
-      if (prev.some((p) => p.dateISO === dateISO && p.start === start && p.end === end)) return prev;
+      // excludeIdがある場合はそれを除外（リサイズ時）
+      let filtered = excludeId ? prev.filter(p => p.id !== excludeId) : prev;
 
       // 同日で重なり or 端が接しているものはマージ
       let mergedStart = start;
       let mergedEnd = end;
       const rest: Slot[] = [];
-      for (const p of prev) {
+      for (const p of filtered) {
         if (p.dateISO !== dateISO) {
           rest.push(p);
           continue;
         }
-        const overlap = !(p.end <= mergedStart || mergedEnd <= p.start); // 交差
-        const touching = p.end === mergedStart || mergedEnd === p.start; // 端が接する
+        const overlap = !(p.end <= mergedStart || mergedEnd <= p.start);
+        const touching = p.end === mergedStart || mergedEnd === p.start;
         if (overlap || touching) {
           mergedStart = Math.min(mergedStart, p.start);
           mergedEnd = Math.max(mergedEnd, p.end);
+          vibrate(5); // マージ時に軽い振動
         } else {
           rest.push(p);
         }
       }
+      const newId = excludeId || crypto.randomUUID();
       return [
         ...rest,
-        { id: crypto.randomUUID(), dateISO, start: mergedStart, end: mergedEnd },
+        { id: newId, dateISO, start: mergedStart, end: mergedEnd },
       ].sort((a, b) =>
         a.dateISO === b.dateISO ? a.start - b.start : a.dateISO.localeCompare(b.dateISO)
       );
@@ -135,31 +128,28 @@ export default function App() {
   const gesture = useRef<{
     downY: number;
     scrollTop: number;
-    moved: boolean;
     timer?: number;
   } | null>(null);
-  const LONG_PRESS_MS = 300;     // 長押し時間
-  const MOVE_THRESHOLD_PX = 8;   // 動きすぎたら長押しキャンセル
-  const SCROLL_THRESHOLD_PX = 3; // スクロール発生でキャンセル
+  const LONG_PRESS_MS = 300;
+  const MOVE_THRESHOLD_PX = 8;
+  const SCROLL_THRESHOLD_PX = 3;
 
   const onTrackPointerDown: React.PointerEventHandler<HTMLDivElement> = (e) => {
     if (!trackRef.current) return;
-
     const rect = trackRef.current.getBoundingClientRect();
     const yRel = e.clientY - rect.top + trackRef.current.scrollTop;
     const startMin = yToMinute(yRel);
 
-    // 長押しタイマー開始（タップはすべてスクロール扱い、登録は長押しのみ）
     if (gesture.current?.timer) window.clearTimeout(gesture.current.timer);
-    gesture.current = { downY: yRel, scrollTop: trackRef.current.scrollTop, moved: false };
+    gesture.current = { downY: yRel, scrollTop: trackRef.current.scrollTop };
 
     const t = window.setTimeout(() => {
       if (!trackRef.current || !gesture.current) return;
       const scrolled = Math.abs(trackRef.current.scrollTop - gesture.current.scrollTop) > SCROLL_THRESHOLD_PX;
-      const moved = Math.abs(gesture.current.downY - yRel) > MOVE_THRESHOLD_PX;
-      if (scrolled || moved) return; // スクロール/移動が大きい＝登録しない
+      if (scrolled) return;
       // 長押し成立 → 30分枠を追加
-      addOrMergeSlot(activeDateISO, startMin, startMin + STEP);
+      addOrMergeSlot(activeDateISO, startMin, startMin + 30);
+      vibrate(20); // 作成時の振動
     }, LONG_PRESS_MS);
     gesture.current.timer = t;
   };
@@ -180,7 +170,6 @@ export default function App() {
     if (Math.abs(yRel - gesture.current.downY) > MOVE_THRESHOLD_PX) {
       if (gesture.current.timer) window.clearTimeout(gesture.current.timer);
       gesture.current = null;
-      return;
     }
   };
 
@@ -188,6 +177,62 @@ export default function App() {
     if (gesture.current?.timer) window.clearTimeout(gesture.current.timer);
     gesture.current = null;
   };
+
+  // === グローバルポインターイベント（リサイズ処理）===
+  useEffect(() => {
+    if (!dragging) return;
+
+    const handlePointerMove = (e: PointerEvent) => {
+      if (!trackRef.current || !dragging) return;
+      const rect = trackRef.current.getBoundingClientRect();
+      const yRel = e.clientY - rect.top + trackRef.current.scrollTop;
+      const targetMin = yToMinute(yRel);
+
+      let newStart = dragging.originalSlot.start;
+      let newEnd = dragging.originalSlot.end;
+
+      if (dragging.mode === "resize-start") {
+        newStart = Math.min(targetMin, dragging.originalSlot.end - 30);
+        newStart = clamp(newStart, 0, 1425);
+      } else {
+        newEnd = Math.max(targetMin, dragging.originalSlot.start + 30);
+        newEnd = clamp(newEnd, 30, 1440);
+      }
+
+      // 15分単位でスナップしたときに振動
+      if (targetMin % 15 === 0 && (targetMin !== dragging.currentStart && targetMin !== dragging.currentEnd)) {
+        vibrate(3);
+      }
+
+      setDragging(prev => prev ? {
+        ...prev,
+        currentStart: newStart,
+        currentEnd: newEnd
+      } : null);
+    };
+
+    const handlePointerUp = () => {
+      if (dragging) {
+        // リサイズ完了時に新しい枠を作成（マージも自動実行）
+        addOrMergeSlot(
+          dragging.originalSlot.dateISO,
+          dragging.currentStart,
+          dragging.currentEnd,
+          dragging.slotId
+        );
+        vibrate(10); // 確定時の振動
+        setDragging(null);
+      }
+    };
+
+    document.addEventListener("pointermove", handlePointerMove);
+    document.addEventListener("pointerup", handlePointerUp);
+
+    return () => {
+      document.removeEventListener("pointermove", handlePointerMove);
+      document.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [dragging]);
 
   // === 出力テキスト ===
   const selectedSlotsSorted = useMemo(
@@ -316,24 +361,31 @@ export default function App() {
           </div>
         </div>
 
-        {/* === 時間トラック（長押しで30分枠作成 / ハンドルでリサイズ） === */}
+        {/* === 時間トラック === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
+          <div className="text-sm font-medium mb-2">{activeDateISO} の時間選択</div>
+          <div className="text-xs text-gray-500 mb-2">長押しで30分枠作成 → 上下の端をドラッグで調整</div>
           <div
             ref={trackRef}
-            className="relative h-[420px] overflow-auto border rounded-lg select-none bg-[linear-gradient(#f8fafc_23px,transparent_24px)] [background-size:100%_24px]"
+            className="relative h-[420px] overflow-auto border rounded-lg select-none"
+            style={{
+              background: `linear-gradient(#f8fafc ${ROW_HEIGHT - 1}px, transparent 1px)`,
+              backgroundSize: `100% ${ROW_HEIGHT}px`
+            }}
             onPointerDown={onTrackPointerDown}
             onPointerMove={onTrackPointerMove}
             onPointerUp={onTrackPointerUp}
             onPointerCancel={onTrackPointerUp}
           >
-            {/* 時刻目盛り（左） */}
+            {/* 時刻目盛り */}
             <div className="absolute left-0 top-0 w-full pointer-events-none">
-              {Array.from({ length: ROWS + 1 }).map((_, i) => {
-                const m = i * STEP;
+              {Array.from({ length: 25 }).map((_, i) => {
+                const hour = i;
+                const m = hour * 60;
                 const y = minuteToY(m);
                 return (
-                  <div key={i} style={{ top: y - 8 }} className="absolute left-2 text-[10px] text-gray-400">
-                    {m % 60 === 0 ? mm(m) : ""}
+                  <div key={i} style={{ top: y - 8 }} className="absolute left-2 text-[11px] text-gray-500 font-medium">
+                    {`${pad(hour)}:00`}
                   </div>
                 );
               })}
@@ -343,51 +395,50 @@ export default function App() {
             {daySlots.map((s) => {
               const top = minuteToY(s.start);
               const height = minuteToY(s.end) - minuteToY(s.start);
-              const active = dragging?.slotId === s.id;
               return (
                 <div
                   key={s.id}
-                  className={`absolute left-10 right-3 rounded-lg border select-none ${
-                    active ? "bg-teal-500/30 border-teal-700 shadow-md" : "bg-teal-500/25 border-teal-500"
-                  }`}
+                  className="absolute left-12 right-3 rounded-lg border bg-teal-500/20 border-teal-500"
                   style={{ top, height }}
-                  onPointerDown={(e) => e.stopPropagation()} // バンド上は新規作成させない
+                  onPointerDown={(e) => e.stopPropagation()}
                 >
-                  {/* 上ハンドル（6px／掴み中は濃色） */}
+                  {/* 上ハンドル（10px） */}
                   <div
-                    className={`absolute top-0 left-0 right-0 h-[6px] bg-teal-500/60 cursor-[ns-resize] touch-none ${
-                      active && dragging?.mode === "resize-start" ? "bg-teal-600" : ""
-                    }`}
+                    className="absolute -top-[5px] left-0 right-0 h-[10px] bg-teal-600 rounded-t-md cursor-ns-resize touch-none active:bg-teal-700"
+                    style={{ boxShadow: '0 -2px 4px rgba(0,0,0,0.1)' }}
                     onPointerDown={(e) => {
                       e.stopPropagation();
-                      if (!trackRef.current) return;
-                      const rect = trackRef.current.getBoundingClientRect();
-                      const yRel = (e as any).clientY - rect.top + trackRef.current.scrollTop; // 相対Y
-                      try { (e.target as HTMLElement).setPointerCapture((e as any).pointerId); } catch {}
-                      setDragging({ mode: "resize-start", startY: yRel, startMin: s.start, endMin: s.end, slotId: s.id });
-                      setHoverRange({ start: s.start, end: s.end });
+                      setDragging({
+                        mode: "resize-start",
+                        slotId: s.id,
+                        originalSlot: s,
+                        currentStart: s.start,
+                        currentEnd: s.end
+                      });
+                      vibrate(10);
                     }}
                   />
-                  {/* 下ハンドル（6px／掴み中は濃色） */}
+                  {/* 下ハンドル（10px） */}
                   <div
-                    className={`absolute bottom-0 left-0 right-0 h-[6px] bg-teal-500/60 cursor-[ns-resize] touch-none ${
-                      active && dragging?.mode === "resize-end" ? "bg-teal-600" : ""
-                    }`}
+                    className="absolute -bottom-[5px] left-0 right-0 h-[10px] bg-teal-600 rounded-b-md cursor-ns-resize touch-none active:bg-teal-700"
+                    style={{ boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }}
                     onPointerDown={(e) => {
                       e.stopPropagation();
-                      if (!trackRef.current) return;
-                      const rect = trackRef.current.getBoundingClientRect();
-                      const yRel = (e as any).clientY - rect.top + trackRef.current.scrollTop; // 相対Y
-                      try { (e.target as HTMLElement).setPointerCapture((e as any).pointerId); } catch {}
-                      setDragging({ mode: "resize-end", startY: yRel, startMin: s.start, endMin: s.end, slotId: s.id });
-                      setHoverRange({ start: s.start, end: s.end });
+                      setDragging({
+                        mode: "resize-end",
+                        slotId: s.id,
+                        originalSlot: s,
+                        currentStart: s.start,
+                        currentEnd: s.end
+                      });
+                      vibrate(10);
                     }}
                   />
-                  {/* バンドラベル＆削除 */}
-                  <div className="absolute inset-0 flex items-center justify-between px-2 text-xs">
-                    <div className="font-medium">{mm(s.start)}〜{mm(s.end)}</div>
+                  {/* バンドラベル */}
+                  <div className="absolute inset-0 flex items-center justify-between px-2 py-1">
+                    <div className="text-xs font-medium">{mm(s.start)}〜{mm(s.end)}</div>
                     <button
-                      className="px-2 py-0.5 text-[11px] rounded bg-white/90 border hover:bg-red-50"
+                      className="px-2 py-0.5 text-[10px] rounded bg-white/90 border hover:bg-red-50"
                       onClick={() => removeSlot(s.id)}
                       onPointerDown={(e) => e.stopPropagation()}
                     >
@@ -398,19 +449,23 @@ export default function App() {
               );
             })}
 
-            {/* リサイズ中プレビュー */}
-            {hoverRange && (
+            {/* ドラッグ中のプレビュー */}
+            {dragging && dragging.originalSlot.dateISO === activeDateISO && (
               <div
-                className="absolute left-10 right-3 rounded-lg border border-dashed border-teal-600 bg-teal-200/30 pointer-events-none"
-                style={{ top: minuteToY(hoverRange.start), height: minuteToY(hoverRange.end) - minuteToY(hoverRange.start) }}
+                className="absolute left-12 right-3 rounded-lg border-2 border-dashed border-teal-700 bg-teal-300/40"
+                style={{
+                  top: minuteToY(dragging.currentStart),
+                  height: minuteToY(dragging.currentEnd) - minuteToY(dragging.currentStart)
+                }}
               >
-                <div className="absolute right-2 top-1 text-xs font-semibold bg-white/70 px-1 rounded">
-                  {mm(hoverRange.start)}〜{mm(hoverRange.end)}
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <div className="bg-white/95 px-3 py-1 rounded-md shadow-lg font-bold text-sm">
+                    {mm(dragging.currentStart)}〜{mm(dragging.currentEnd)}
+                  </div>
                 </div>
               </div>
             )}
 
-            {/* スクロール用のダミー（長押しのみ登録） */}
             <div style={{ height: TRACK_HEIGHT }} />
           </div>
         </div>
@@ -468,7 +523,7 @@ export default function App() {
         </div>
 
         <p className="text-xs text-gray-500">
-          保存はブラウザのローカルストレージに行われます。同じURLでも他の端末・ブラウザとはデータが共有されません。
+          ※データはこのセッション中のみ保持されます。ページをリロードするとリセットされます。
         </p>
       </div>
     </div>
