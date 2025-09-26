@@ -52,26 +52,14 @@ export default function App() {
   const [dragging, setDragging] = useState<
     | null
     | {
-        mode: "new" | "resize-start" | "resize-end";
-        startY: number;   // screen y at start
+        mode: "resize-start" | "resize-end";
+        startY: number;   // pointer clientY at drag start (converted)
         startMin: number; // minute start at drag start
         endMin: number;   // minute end at drag start
-        slotId?: string;
+        slotId: string;
       }
   >(null);
   const [hoverRange, setHoverRange] = useState<{ start: number; end: number } | null>(null);
-
-  // === 一時デバッグ表示（どこを修正したか画面で可視化） ===
-  const [showDebug, setShowDebug] = useState(true); // 公開時は false でOK
-
-  // --- タップ→伸ばす用のアンカー & ジェスチャ判定 ---
-  const [anchorStart, setAnchorStart] = useState<number | null>(null);
-  /** ポインタダウン時の一時情報（スクロール判定に使う） */
-  const gesture = useRef<{ downY: number; downTime: number; scrollTop: number } | null>(null);
-
-  // 判定しきい値（必要に応じて微調整）
-  const MOVE_THRESHOLD_PX = 6;   // これ以上動いたら「ドラッグ」
-  const SCROLL_THRESHOLD_PX = 3; // スクロール量がこれを超えたら「スクロール扱い」
 
   // ==== タイムトラック描画パラメータ ====
   const MINUTES_PER_DAY = 24 * 60;
@@ -82,7 +70,7 @@ export default function App() {
   const minuteToY = (m: number) => (m / STEP) * ROW_HEIGHT;
   const yToMinute = (y: number) => clamp(floorTo30((y / ROW_HEIGHT) * STEP), 0, 1440);
 
-  // === 月カレンダー計算 ===
+  // === 月カレンダー計算（左:月曜〜右:日曜）===
   const firstOfMonth = useMemo(() => new Date(year, month, 1), [year, month]);
   const daysInMonth = useMemo(() => new Date(year, month + 1, 0).getDate(), [year, month]);
   const leadingBlanks = useMemo(() => weekdayMonStart(firstOfMonth.getDay()), [firstOfMonth]);
@@ -141,91 +129,67 @@ export default function App() {
 
   const removeSlot = (id: string) => setSlots((prev) => prev.filter((s) => s.id !== id));
 
-  // === タップ→伸ばす：ハンドラ ===
+  // === 「スクロール優先 / 登録は長押しのみ」のジェスチャ ===
+  const gesture = useRef<{
+    downY: number;
+    scrollTop: number;
+    moved: boolean;
+    timer?: number;
+  } | null>(null);
+  const LONG_PRESS_MS = 300;     // 長押し時間
+  const MOVE_THRESHOLD_PX = 8;   // 動きすぎたら長押しキャンセル
+  const SCROLL_THRESHOLD_PX = 3; // スクロール発生でキャンセル
+
   const onTrackPointerDown: React.PointerEventHandler<HTMLDivElement> = (e) => {
-    // 子要素（削除ボタン、既存バンド）を触ったら新規作成しない
     if (!trackRef.current) return;
 
     const rect = trackRef.current.getBoundingClientRect();
     const y = e.clientY - rect.top + trackRef.current.scrollTop;
-
-    // スクロール検出のための初期値（ここでは pointer capture を取らない）
-    gesture.current = {
-      downY: y,
-      downTime: Date.now(),
-      scrollTop: trackRef.current.scrollTop,
-    };
-
-    // タップ直後に開始点を確定＆30分の仮レンジを表示（“タップで選べない”を解消）
     const startMin = yToMinute(y);
-    setAnchorStart(startMin);
-    setDragging({ mode: "new", startY: y, startMin, endMin: startMin + STEP });
-    setHoverRange({ start: startMin, end: startMin + STEP });
+
+    // 既存バンド・ボタンの上は stopPropagation 済みなのでここに来ない
+    // 長押しタイマー開始
+    if (gesture.current?.timer) window.clearTimeout(gesture.current.timer);
+    gesture.current = { downY: y, scrollTop: trackRef.current.scrollTop, moved: false };
+
+    const t = window.setTimeout(() => {
+      // 長押し成立：この時点で30分枠を即追加（スクロール/移動が小さい場合のみ）
+      if (!trackRef.current || !gesture.current) return;
+      const scrolled = Math.abs(trackRef.current.scrollTop - gesture.current.scrollTop) > SCROLL_THRESHOLD_PX;
+      const moved = Math.abs(gesture.current.downY - y) > MOVE_THRESHOLD_PX;
+      if (scrolled || moved) return; // 実質スクロール/移動扱い
+
+      addOrMergeSlot(activeDateISO, startMin, startMin + STEP);
+      // ユーザーはこの後、上下ハンドル（6px）で伸縮できる
+    }, LONG_PRESS_MS);
+    gesture.current.timer = t;
   };
 
   const onTrackPointerMove: React.PointerEventHandler<HTMLDivElement> = (e) => {
     if (!trackRef.current) return;
-
-    // スクロール検出：scrollTop変化がしきい値超なら“スクロール扱い”でキャンセル
-    if (gesture.current) {
-      const scrolled = Math.abs(trackRef.current.scrollTop - gesture.current.scrollTop) > SCROLL_THRESHOLD_PX;
-      if (scrolled) {
-        gesture.current = null;
-        setDragging(null);
-        setHoverRange(null);
-        return;
-      }
-    }
-
-    if (!dragging) return;
+    if (!gesture.current) return;
 
     const rect = trackRef.current.getBoundingClientRect();
     const y = e.clientY - rect.top + trackRef.current.scrollTop;
 
-    // タップ位置から十分動いたら、ここで初めて pointer capture を取って“伸ばし”に移行
-    if ((e as any).pointerId && Math.abs(y - (gesture.current?.downY ?? y)) > MOVE_THRESHOLD_PX) {
-      try {
-        (e.target as HTMLElement).setPointerCapture((e as any).pointerId);
-      } catch {}
+    // スクロール検出（scrollTopの変化）
+    const scrolled = Math.abs(trackRef.current.scrollTop - gesture.current.scrollTop) > SCROLL_THRESHOLD_PX;
+    if (scrolled) {
+      if (gesture.current.timer) window.clearTimeout(gesture.current.timer);
+      gesture.current = null;
+      return;
     }
 
-    if (dragging.mode === "new") {
-      const end = clamp(floorTo30(yToMinute(y)), 0, 1440);
-      const s = Math.min(dragging.startMin, end);
-      const t = Math.max(dragging.startMin + STEP, end); // 最低30分
-      setHoverRange({ start: clamp(s, 0, 1410), end: clamp(t, 30, 1440) });
-    } else if (dragging.mode === "resize-start") {
-      const dy = y - dragging.startY;
-      const newStart = clamp(floorTo30(dragging.startMin + yToMinute(dy)), 0, dragging.endMin - STEP);
-      setHoverRange({ start: newStart, end: dragging.endMin });
-    } else if (dragging.mode === "resize-end") {
-      const dy = y - dragging.startY;
-      const newEnd = clamp(floorTo30(dragging.endMin + yToMinute(dy)), dragging.startMin + STEP, 1440);
-      setHoverRange({ start: dragging.startMin, end: newEnd });
+    // 移動し過ぎは長押しキャンセル（スクロール/ドラッグ意図）
+    if (Math.abs(y - gesture.current.downY) > MOVE_THRESHOLD_PX) {
+      if (gesture.current.timer) window.clearTimeout(gesture.current.timer);
+      gesture.current = null;
+      return;
     }
   };
 
   const onTrackPointerUp: React.PointerEventHandler<HTMLDivElement> = () => {
-    // スクロール認定されていたら何もしない
-    if (!dragging) {
-      gesture.current = null;
-      setHoverRange(null);
-      return;
-    }
-
-    if (hoverRange) {
-      if (dragging.mode === "new") {
-        // タップ→離す だけでも 30分枠を確定
-        addOrMergeSlot(activeDateISO, hoverRange.start, hoverRange.end);
-      } else if (dragging.slotId) {
-        setSlots((prev) =>
-          prev.map((s) => (s.id === dragging.slotId ? { ...s, start: hoverRange.start, end: hoverRange.end } : s))
-        );
-      }
-    }
-
-    setDragging(null);
-    setHoverRange(null);
+    if (gesture.current?.timer) window.clearTimeout(gesture.current.timer);
     gesture.current = null;
   };
 
@@ -322,16 +286,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-gray-50">
       <div className="mx-auto max-w-md p-4">
-        <div className="flex items-center justify-between">
-          <h1 className="text-2xl font-bold mb-3">アポイント候補メーカー</h1>
-          {/* 一時デバッグ表示トグル（公開時は消してOK） */}
-          <button
-            className="ml-4 px-2 py-1 text-xs border rounded bg-yellow-50 hover:bg-yellow-100"
-            onClick={() => setShowDebug((v) => !v)}
-          >
-            デバッグ表示: {showDebug ? "ON" : "OFF"}
-          </button>
-        </div>
+        <h1 className="text-2xl font-bold mb-3">アポイント候補メーカー</h1>
 
         {/* === カレンダー === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
@@ -365,7 +320,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* === 時間トラック === */}
+        {/* === 時間トラック（長押しで30分枠作成） === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
           <div
             ref={trackRef}
@@ -375,16 +330,6 @@ export default function App() {
             onPointerUp={onTrackPointerUp}
             onPointerCancel={onTrackPointerUp}
           >
-            {/* === デバッグオーバーレイ（右上） 一時表示 === */}
-            {showDebug && (
-              <div className="absolute z-10 right-2 top-2 text-[11px] bg-yellow-100 border border-yellow-300 rounded px-2 py-1 shadow">
-                <div>修正：タップで開始 → 伸ばすで調整</div>
-                <div>開始: {anchorStart != null ? mm(anchorStart) : "-"}</div>
-                <div>状態: {dragging ? dragging.mode : "none"}</div>
-                <div>選択: {hoverRange ? `${mm(hoverRange.start)}〜${mm(hoverRange.end)}` : "-"}</div>
-              </div>
-            )}
-
             {/* 時刻目盛り（左） */}
             <div className="absolute left-0 top-0 w-full pointer-events-none">
               {Array.from({ length: ROWS + 1 }).map((_, i) => {
@@ -407,11 +352,11 @@ export default function App() {
                   key={s.id}
                   className="absolute left-10 right-3 rounded-lg bg-teal-500/25 border border-teal-500"
                   style={{ top, height }}
-                  onPointerDown={(e) => e.stopPropagation()}
+                  onPointerDown={(e) => e.stopPropagation()} // バンド上は新規作成させない
                 >
-                  {/* 上下ハンドル・表示・削除ボタン… */}
+                  {/* ハンドル（上下6px） */}
                   <div
-                    className="absolute top-0 left-0 right-0 h-1 bg-teal-500/60 cursor-[ns-resize]"
+                    className="absolute top-0 left-0 right-0 h-[6px] bg-teal-500/60 cursor-[ns-resize]"
                     onPointerDown={(e) => {
                       e.stopPropagation();
                       (e.target as HTMLElement).setPointerCapture((e as any).pointerId);
@@ -420,7 +365,7 @@ export default function App() {
                     }}
                   />
                   <div
-                    className="absolute bottom-0 left-0 right-0 h-1 bg-teal-500/60 cursor-[ns-resize]"
+                    className="absolute bottom-0 left-0 right-0 h-[6px] bg-teal-500/60 cursor-[ns-resize]"
                     onPointerDown={(e) => {
                       e.stopPropagation();
                       (e.target as HTMLElement).setPointerCapture((e as any).pointerId);
@@ -442,10 +387,10 @@ export default function App() {
               );
             })}
 
-            {/* ドラッグ中プレビュー */}
+            {/* リサイズ中プレビュー */}
             {hoverRange && (
               <div
-                className="absolute left-10 right-3 rounded-lg border border-dashed border-teal-600 bg-teal-200/30"
+                className="absolute left-10 right-3 rounded-lg border border-dashed border-teal-600 bg-teal-200/30 pointer-events-none"
                 style={{ top: minuteToY(hoverRange.start), height: minuteToY(hoverRange.end) - minuteToY(hoverRange.start) }}
               >
                 <div className="absolute right-2 top-1 text-xs font-semibold bg-white/70 px-1 rounded">
@@ -454,7 +399,7 @@ export default function App() {
               </div>
             )}
 
-            {/* スクロール用のダミー */}
+            {/* スクロール用のダミー（タップ対象になるが挙動は長押しのみ） */}
             <div style={{ height: TRACK_HEIGHT }} />
           </div>
         </div>
