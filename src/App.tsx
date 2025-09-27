@@ -86,6 +86,7 @@ export default function App() {
 
   // 今日 & カレンダー表示年月
   const today = useMemo(() => new Date(), []);
+  const todayISO = useMemo(() => toISODate(today), [today]);
   const [year, setYear] = useSafeLocalStorage<number>(ns("year"), today.getFullYear());
   const [month, setMonth] = useSafeLocalStorage<number>(ns("month"), today.getMonth());
   const [activeDateISO, setActiveDateISO] = useSafeLocalStorage<string>(ns("activeDate"), toISODate(today));
@@ -109,6 +110,7 @@ export default function App() {
         startMin: number; // 開始時の開始分
         endMin: number;   // 開始時の終了分
         slotId: string;
+        initialScrollTop?: number; // 移動開始時のスクロール位置
       }
   >(null);
   const [hoverRange, setHoverRange] = useState<{ start: number; end: number } | null>(null);
@@ -239,11 +241,23 @@ export default function App() {
     slot: Slot
   ) => {
     e.stopPropagation();
+    e.preventDefault(); // スクロールを防ぐ
     if (!trackRef.current) return;
     const rect = trackRef.current.getBoundingClientRect();
     const yRel = e.clientY - rect.top + trackRef.current.scrollTop;
     try { (e.target as HTMLElement).setPointerCapture((e as any).pointerId); } catch {}
-    setDragging({ mode, startY: yRel, startMin: slot.start, endMin: slot.end, slotId: slot.id });
+    
+    // 移動モードの場合、現在のスクロール位置を記録
+    const initialScrollTop = mode === "move" ? trackRef.current.scrollTop : undefined;
+    
+    setDragging({ 
+      mode, 
+      startY: yRel, 
+      startMin: slot.start, 
+      endMin: slot.end, 
+      slotId: slot.id,
+      initialScrollTop 
+    });
     setHoverRange({ start: slot.start, end: slot.end });
     vibrate(8);
   };
@@ -275,8 +289,15 @@ export default function App() {
 
   const onDocPointerMove = (e: PointerEvent) => {
     if (!dragging || !trackRef.current) return;
+    
     const rect = trackRef.current.getBoundingClientRect();
     const clientY = e.clientY;
+    
+    // 移動モードの場合のみ、スクロールを固定
+    if (dragging.mode === "move" && dragging.initialScrollTop !== undefined) {
+      // スクロール位置を初期値に戻す（通常スクロールを無効化）
+      trackRef.current.scrollTop = dragging.initialScrollTop;
+    }
     
     // 自動スクロール判定（端から20px以内）
     if (clientY < rect.top + 20) {
@@ -326,6 +347,21 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dragging, hoverRange, activeDateISO, slots]);
+
+  // 移動中のスクロール防止
+  useEffect(() => {
+    if (dragging?.mode === "move" && trackRef.current) {
+      const preventScroll = (e: Event) => {
+        if (dragging?.initialScrollTop !== undefined && trackRef.current) {
+          trackRef.current.scrollTop = dragging.initialScrollTop;
+        }
+      };
+      trackRef.current.addEventListener('scroll', preventScroll);
+      return () => {
+        trackRef.current?.removeEventListener('scroll', preventScroll);
+      };
+    }
+  }, [dragging]);
 
   /** === 出力テキスト === */
   const selectedSlotsSorted = useMemo(
@@ -453,15 +489,26 @@ export default function App() {
               if (!d) return <div key={idx} className="h-10 rounded bg-transparent" />;
               const iso = toISODate(d);
               const isActive = iso === activeDateISO;
+              const isToday = iso === todayISO;
               const wd = weekdayMonStart(d.getDay());
               const wkClass = wd === 5 ? "text-blue-600" : wd === 6 ? "text-red-600" : "";
+              
               return (
                 <button
                   key={iso}
                   onClick={() => setActiveDateISO(iso)}
-                  className={`h-10 rounded-lg border text-sm ${wkClass} ${isActive ? "bg-teal-100 border-teal-300" : "bg-white border-gray-200 hover:bg-gray-50"}`}
+                  className={`h-10 rounded-lg border text-sm relative ${wkClass} ${
+                    isActive 
+                      ? "bg-teal-100 border-teal-300" 
+                      : isToday 
+                        ? "bg-gray-100 border-gray-400" 
+                        : "bg-white border-gray-200 hover:bg-gray-50"
+                  }`}
                 >
                   {d.getDate()}
+                  {isToday && (
+                    <span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 bg-blue-500 rounded-full"></span>
+                  )}
                 </button>
               );
             })}
@@ -538,14 +585,16 @@ export default function App() {
                     }
                   }}
                 >
-                  {/* 右上リサイズハンドル（○ボタン） */}
+                  {/* 右上リサイズハンドル（○ボタン） - 少し内側に配置 */}
                   <div
-                    className="resize-handle absolute -top-2 -right-2 w-4 h-4 bg-teal-600 rounded-full cursor-nw-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
+                    className="resize-handle absolute w-4 h-4 bg-teal-600 rounded-full cursor-nw-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
+                    style={{ top: '-6px', right: '10%' }}
                     onPointerDown={(e) => onHandleDown(e, "resize-start", s)}
                   />
-                  {/* 左下リサイズハンドル（○ボタン） */}
+                  {/* 左下リサイズハンドル（○ボタン） - 少し内側に配置 */}
                   <div
-                    className="resize-handle absolute -bottom-2 -left-2 w-4 h-4 bg-teal-600 rounded-full cursor-se-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
+                    className="resize-handle absolute w-4 h-4 bg-teal-600 rounded-full cursor-se-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
+                    style={{ bottom: '-6px', left: '10%' }}
                     onPointerDown={(e) => onHandleDown(e, "resize-end", s)}
                   />
                   {/* ラベル & 削除 */}
