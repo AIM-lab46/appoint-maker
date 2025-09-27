@@ -438,7 +438,7 @@ export default function App() {
     <div className="min-h-screen bg-gray-50">
       <div className="mx-auto max-w-md p-4">
         <div className="flex items-center justify-between">
-          <h1 className="text-2xl font-bold mb-3">アポイント候補メーカー</h1>
+          <h1 className="text-2xl font-bold mb-3">アポイント文作成</h1>
           <div className="text-[11px] text-gray-500">UID: <span className="font-mono">{uid}</span></div>
         </div>
 
@@ -488,7 +488,6 @@ export default function App() {
         {/* === 時間トラック（長押し→30分枠 / ○ボタンでリサイズのみ） === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
           <div className="text-sm font-medium mb-2">{activeDateISO} の時間選択</div>
-          <div className="text-xs text-gray-500 mb-2">長押しで30分枠作成 → ○ボタンで時間調整</div>
           <div
             ref={trackRef}
             className="relative h-[420px] overflow-auto border rounded-lg select-none bg-gray-50"
@@ -673,7 +672,6 @@ export default function App() {
             onChange={(e) => updateTemplateContent(activeTplId, e.target.value)}
           />
           <div className="flex justify-between mt-2">
-            <div className="text-xs text-gray-500">※ 自動保存されています（この端末・このUID内）</div>
             <button
               className="px-3 py-1 rounded border bg-gray-50 hover:bg-gray-100 text-sm"
               onClick={() => resetTemplate(activeTplId)}
@@ -694,7 +692,7 @@ export default function App() {
           </div>
         </div>
 
-        <p className="text-xs text-gray-500">
+        <p className="hidden text-xs text-gray-500">
           ※このツールはブラウザ保存です。同じURLでも <b>?uid=任意の文字</b> を付けると保存領域が分かれます（例：<span className="font-mono">?uid=a-san</span>）。
         </p>
       </div>
