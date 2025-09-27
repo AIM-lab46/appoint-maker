@@ -98,12 +98,13 @@ export default function App() {
 
   // タイムトラック
   const trackRef = useRef<HTMLDivElement | null>(null);
+  const autoScrollInterval = useRef<number | null>(null);
 
-  // リサイズ用ドラッグ状態
+  // ドラッグ状態（リサイズと移動を統合）
   const [dragging, setDragging] = useState<
     | null
     | {
-        mode: "resize-start" | "resize-end";
+        mode: "resize-start" | "resize-end" | "move";
         startY: number;   // トラック相対Y(px)
         startMin: number; // 開始時の開始分
         endMin: number;   // 開始時の終了分
@@ -142,21 +143,24 @@ export default function App() {
   );
 
   // === 追加・マージ・重複排除ロジック ===
-  function addOrMergeSlot(dateISO: string, start: number, end: number) {
+  function addOrMergeSlot(dateISO: string, start: number, end: number, excludeId?: string) {
     start = clamp(start, 0, 1440 - STEP);
     end = clamp(end, STEP, 1440);
     if (end - start < 30) end = Math.min(start + 30, 1440); // 最小30分
     if (start >= end) return;
 
     setSlots((prev) => {
+      // 移動の場合は元のスロットを除外
+      const filtered = excludeId ? prev.filter((p) => p.id !== excludeId) : prev;
+      
       // 完全重複は無視
-      if (prev.some((p) => p.dateISO === dateISO && p.start === start && p.end === end)) return prev;
+      if (filtered.some((p) => p.dateISO === dateISO && p.start === start && p.end === end)) return prev;
 
       // 同日で重なり or 端が接しているものはマージ
       let mergedStart = start;
       let mergedEnd = end;
       const rest: Slot[] = [];
-      for (const p of prev) {
+      for (const p of filtered) {
         if (p.dateISO !== dateISO) {
           rest.push(p);
           continue;
@@ -173,7 +177,7 @@ export default function App() {
       }
       return [
         ...rest,
-        { id: crypto.randomUUID(), dateISO, start: mergedStart, end: mergedEnd },
+        { id: excludeId || crypto.randomUUID(), dateISO, start: mergedStart, end: mergedEnd },
       ].sort((a, b) =>
         a.dateISO === b.dateISO ? a.start - b.start : a.dateISO.localeCompare(b.dateISO)
       );
@@ -228,10 +232,10 @@ export default function App() {
     gesture.current = null;
   };
 
-  /** === リサイズ（上下ハンドル） === */
+  /** === リサイズ（○ボタン）と移動 === */
   const onHandleDown = (
     e: React.PointerEvent<HTMLDivElement>,
-    mode: "resize-start" | "resize-end",
+    mode: "resize-start" | "resize-end" | "move",
     slot: Slot
   ) => {
     e.stopPropagation();
@@ -244,46 +248,68 @@ export default function App() {
     vibrate(8);
   };
 
+  // 自動スクロール
+  const startAutoScroll = (direction: 'up' | 'down') => {
+    if (autoScrollInterval.current) return;
+    
+    autoScrollInterval.current = window.setInterval(() => {
+      if (!trackRef.current) return;
+      const scrollSpeed = 3;
+      if (direction === 'up') {
+        trackRef.current.scrollTop = Math.max(0, trackRef.current.scrollTop - scrollSpeed);
+      } else {
+        trackRef.current.scrollTop = Math.min(
+          trackRef.current.scrollHeight - trackRef.current.clientHeight,
+          trackRef.current.scrollTop + scrollSpeed
+        );
+      }
+    }, 16); // 約60fps
+  };
+
+  const stopAutoScroll = () => {
+    if (autoScrollInterval.current) {
+      clearInterval(autoScrollInterval.current);
+      autoScrollInterval.current = null;
+    }
+  };
+
   const onDocPointerMove = (e: PointerEvent) => {
     if (!dragging || !trackRef.current) return;
     const rect = trackRef.current.getBoundingClientRect();
-    const yRel = e.clientY - rect.top + trackRef.current.scrollTop;
+    const clientY = e.clientY;
+    
+    // 自動スクロール判定（端から20px以内）
+    if (clientY < rect.top + 20) {
+      startAutoScroll('up');
+    } else if (clientY > rect.bottom - 20) {
+      startAutoScroll('down');
+    } else {
+      stopAutoScroll();
+    }
+    
+    const yRel = clientY - rect.top + trackRef.current.scrollTop;
     const dyMin = yToMinute(yRel) - yToMinute(dragging.startY);
 
     if (dragging.mode === "resize-start") {
       const ns = clamp(floorTo15(dragging.startMin + dyMin), 0, dragging.endMin - 30);
       setHoverRange({ start: ns, end: dragging.endMin });
-    } else {
+    } else if (dragging.mode === "resize-end") {
       const ne = clamp(floorTo15(dragging.endMin + dyMin), dragging.startMin + 30, 1440);
       setHoverRange({ start: dragging.startMin, end: ne });
+    } else if (dragging.mode === "move") {
+      const duration = dragging.endMin - dragging.startMin;
+      const ns = clamp(floorTo15(dragging.startMin + dyMin), 0, 1440 - duration);
+      setHoverRange({ start: ns, end: ns + duration });
     }
   };
 
   const onDocPointerUp = () => {
+    stopAutoScroll();
     if (!dragging) return;
     if (hoverRange) {
-      // dragging.slotId を置き換え（=リサイズ確定 & マージ）
-      setSlots((prev) => {
-        const rest = prev.filter((p) => p.id !== dragging.slotId);
-        const dateISO = prev.find((p) => p.id === dragging.slotId)?.dateISO || activeDateISO;
-        // まず既存とマージ
-        let start = hoverRange.start;
-        let end = hoverRange.end;
-        const sameDay = rest.filter((p) => p.dateISO === dateISO);
-        for (const p of sameDay) {
-          const overlap = !(p.end <= start || end <= p.start);
-          const touching = p.end === start || end === p.start;
-          if (overlap || touching) {
-            start = Math.min(start, p.start);
-            end = Math.max(end, p.end);
-          }
-        }
-        const mergedId = crypto.randomUUID();
-        const merged: Slot = { id: mergedId, dateISO, start, end };
-        return [...rest, merged].sort((a, b) =>
-          a.dateISO === b.dateISO ? a.start - b.start : a.dateISO.localeCompare(b.dateISO)
-        );
-      });
+      // 移動またはリサイズ確定
+      const dateISO = slots.find((p) => p.id === dragging.slotId)?.dateISO || activeDateISO;
+      addOrMergeSlot(dateISO, hoverRange.start, hoverRange.end, dragging.slotId);
     }
     setDragging(null);
     setHoverRange(null);
@@ -296,9 +322,10 @@ export default function App() {
     return () => {
       document.removeEventListener("pointermove", onDocPointerMove);
       document.removeEventListener("pointerup", onDocPointerUp);
+      stopAutoScroll();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dragging, hoverRange, activeDateISO]);
+  }, [dragging, hoverRange, activeDateISO, slots]);
 
   /** === 出力テキスト === */
   const selectedSlotsSorted = useMemo(
@@ -441,16 +468,31 @@ export default function App() {
           </div>
         </div>
 
-        {/* === 時間トラック（長押し→30分枠 / ハンドルでリサイズ） === */}
+        {/* === 時間トラック（長押し→30分枠 / ○ボタンでリサイズ / 枠内ドラッグで移動） === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
           <div className="text-sm font-medium mb-2">{activeDateISO} の時間選択</div>
-          <div className="text-xs text-gray-500 mb-2">長押しで30分枠作成 → 上下の端をドラッグで調整</div>
+          <div className="text-xs text-gray-500 mb-2">長押しで30分枠作成 → ○ボタンで伸縮 / 枠内で移動</div>
           <div
             ref={trackRef}
             className="relative h-[420px] overflow-auto border rounded-lg select-none"
             style={{
-              background: `linear-gradient(#f8fafc ${12 - 1}px, transparent 1px)`,
-              backgroundSize: `100% 12px`
+              background: `
+                repeating-linear-gradient(
+                  to bottom,
+                  transparent 0px,
+                  transparent ${ROW_HEIGHT * 2 - 0.5}px,
+                  #e2e8f0 ${ROW_HEIGHT * 2 - 0.5}px,
+                  #e2e8f0 ${ROW_HEIGHT * 2}px
+                ),
+                repeating-linear-gradient(
+                  to bottom,
+                  transparent 0px,
+                  transparent ${ROW_HEIGHT * 4 - 1}px,
+                  #cbd5e1 ${ROW_HEIGHT * 4 - 1}px,
+                  #cbd5e1 ${ROW_HEIGHT * 4}px
+                )
+              `,
+              backgroundColor: '#f8fafc'
             }}
             onPointerDown={onTrackPointerDown}
             onPointerMove={onTrackPointerMove}
@@ -476,30 +518,41 @@ export default function App() {
               const top = minuteToY(s.start);
               const height = minuteToY(s.end) - minuteToY(s.start);
               const active = dragging?.slotId === s.id;
+              const isMoving = active && dragging?.mode === 'move';
               return (
                 <div
                   key={s.id}
-                  className={`absolute left-12 right-3 rounded-lg border select-none ${active ? "bg-teal-500/30 border-teal-700 shadow-md" : "bg-teal-500/20 border-teal-500"}`}
-                  style={{ top, height }}
-                  onPointerDown={(e) => e.stopPropagation()}
+                  className={`absolute left-12 right-3 rounded-lg border select-none transition-opacity ${
+                    active ? "bg-teal-500/30 border-teal-700 shadow-md" : "bg-teal-500/20 border-teal-500"
+                  } ${isMoving ? 'opacity-50' : ''}`}
+                  style={{ 
+                    top, 
+                    height,
+                    transition: dragging?.slotId === s.id ? 'none' : 'all 150ms ease-out'
+                  }}
+                  onPointerDown={(e) => {
+                    // 枠内をクリックしたら移動モード
+                    const target = e.target as HTMLElement;
+                    if (!target.classList.contains('resize-handle') && !target.classList.contains('delete-btn')) {
+                      onHandleDown(e, 'move', s);
+                    }
+                  }}
                 >
-                  {/* 上ハンドル（10px） */}
+                  {/* 右上リサイズハンドル（○ボタン） */}
                   <div
-                    className={`absolute -top-[5px] left-0 right-0 h-[10px] bg-teal-600 rounded-t-md cursor-[ns-resize] touch-none ${active && dragging?.mode === "resize-start" ? "bg-teal-700" : ""}`}
-                    style={{ boxShadow: "0 -2px 4px rgba(0,0,0,0.1)" }}
+                    className="resize-handle absolute -top-2 -right-2 w-4 h-4 bg-teal-600 rounded-full cursor-nw-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
                     onPointerDown={(e) => onHandleDown(e, "resize-start", s)}
                   />
-                  {/* 下ハンドル（10px） */}
+                  {/* 左下リサイズハンドル（○ボタン） */}
                   <div
-                    className={`absolute -bottom-[5px] left-0 right-0 h-[10px] bg-teal-600 rounded-b-md cursor-[ns-resize] touch-none ${active && dragging?.mode === "resize-end" ? "bg-teal-700" : ""}`}
-                    style={{ boxShadow: "0 2px 4px rgba(0,0,0,0.1)" }}
+                    className="resize-handle absolute -bottom-2 -left-2 w-4 h-4 bg-teal-600 rounded-full cursor-se-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
                     onPointerDown={(e) => onHandleDown(e, "resize-end", s)}
                   />
                   {/* ラベル & 削除 */}
-                  <div className="absolute inset-0 flex items-center justify-between px-2 py-1">
-                    <div className="text-xs font-medium">{mm(s.start)}〜{mm(s.end)}</div>
+                  <div className="absolute inset-0 flex items-center justify-between px-2 py-1 pointer-events-none">
+                    <div className="text-xs font-medium pointer-events-none">{mm(s.start)}〜{mm(s.end)}</div>
                     <button
-                      className="px-2 py-0.5 text-[10px] rounded bg-white/90 border hover:bg-red-50"
+                      className="delete-btn px-2 py-0.5 text-[10px] rounded bg-white/90 border hover:bg-red-50 pointer-events-auto"
                       onClick={() => removeSlot(s.id)}
                       onPointerDown={(e) => e.stopPropagation()}
                     >
@@ -510,13 +563,17 @@ export default function App() {
               );
             })}
 
-            {/* リサイズ中プレビュー */}
-            {hoverRange && (
+            {/* リサイズ/移動中プレビュー */}
+            {hoverRange && dragging && (
               <div
                 className="absolute left-12 right-3 rounded-lg border-2 border-dashed border-teal-700 bg-teal-300/40 pointer-events-none"
-                style={{ top: minuteToY(hoverRange.start), height: minuteToY(hoverRange.end) - minuteToY(hoverRange.start) }}
+                style={{ 
+                  top: minuteToY(hoverRange.start), 
+                  height: minuteToY(hoverRange.end) - minuteToY(hoverRange.start),
+                  transition: 'all 100ms ease-out'
+                }}
               >
-                <div className="absolute right-2 top-1 text-xs font-semibold bg-white/80 px-1 rounded">
+                <div className="absolute left-2 top-1 text-xs font-semibold bg-white/90 px-1 rounded">
                   {mm(hoverRange.start)}〜{mm(hoverRange.end)}
                 </div>
               </div>
