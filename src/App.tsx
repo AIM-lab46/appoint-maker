@@ -101,16 +101,15 @@ export default function App() {
   const trackRef = useRef<HTMLDivElement | null>(null);
   const autoScrollInterval = useRef<number | null>(null);
 
-  // ドラッグ状態（リサイズと移動を統合）
+  // ドラッグ状態（リサイズのみ）
   const [dragging, setDragging] = useState<
     | null
     | {
-        mode: "resize-start" | "resize-end" | "move";
+        mode: "resize-start" | "resize-end";
         startY: number;   // トラック相対Y(px)
         startMin: number; // 開始時の開始分
         endMin: number;   // 開始時の終了分
         slotId: string;
-        initialScrollTop?: number; // 移動開始時のスクロール位置
       }
   >(null);
   const [hoverRange, setHoverRange] = useState<{ start: number; end: number } | null>(null);
@@ -234,10 +233,10 @@ export default function App() {
     gesture.current = null;
   };
 
-  /** === リサイズ（○ボタン）と移動 === */
+  /** === リサイズ（○ボタン）のみ === */
   const onHandleDown = (
     e: React.PointerEvent<HTMLDivElement>,
-    mode: "resize-start" | "resize-end" | "move",
+    mode: "resize-start" | "resize-end",
     slot: Slot
   ) => {
     e.stopPropagation();
@@ -247,16 +246,12 @@ export default function App() {
     const yRel = e.clientY - rect.top + trackRef.current.scrollTop;
     try { (e.target as HTMLElement).setPointerCapture((e as any).pointerId); } catch {}
     
-    // 移動モードの場合、現在のスクロール位置を記録
-    const initialScrollTop = mode === "move" ? trackRef.current.scrollTop : undefined;
-    
     setDragging({ 
       mode, 
       startY: yRel, 
       startMin: slot.start, 
       endMin: slot.end, 
-      slotId: slot.id,
-      initialScrollTop 
+      slotId: slot.id
     });
     setHoverRange({ start: slot.start, end: slot.end });
     vibrate(8);
@@ -293,12 +288,6 @@ export default function App() {
     const rect = trackRef.current.getBoundingClientRect();
     const clientY = e.clientY;
     
-    // 移動モードの場合のみ、スクロールを固定
-    if (dragging.mode === "move" && dragging.initialScrollTop !== undefined) {
-      // スクロール位置を初期値に戻す（通常スクロールを無効化）
-      trackRef.current.scrollTop = dragging.initialScrollTop;
-    }
-    
     // 自動スクロール判定（端から20px以内）
     if (clientY < rect.top + 20) {
       startAutoScroll('up');
@@ -317,10 +306,6 @@ export default function App() {
     } else if (dragging.mode === "resize-end") {
       const ne = clamp(floorTo15(dragging.endMin + dyMin), dragging.startMin + 30, 1440);
       setHoverRange({ start: dragging.startMin, end: ne });
-    } else if (dragging.mode === "move") {
-      const duration = dragging.endMin - dragging.startMin;
-      const ns = clamp(floorTo15(dragging.startMin + dyMin), 0, 1440 - duration);
-      setHoverRange({ start: ns, end: ns + duration });
     }
   };
 
@@ -328,7 +313,7 @@ export default function App() {
     stopAutoScroll();
     if (!dragging) return;
     if (hoverRange) {
-      // 移動またはリサイズ確定
+      // リサイズ確定
       const dateISO = slots.find((p) => p.id === dragging.slotId)?.dateISO || activeDateISO;
       addOrMergeSlot(dateISO, hoverRange.start, hoverRange.end, dragging.slotId);
     }
@@ -347,21 +332,6 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dragging, hoverRange, activeDateISO, slots]);
-
-  // 移動中のスクロール防止
-  useEffect(() => {
-    if (dragging?.mode === "move" && trackRef.current) {
-      const preventScroll = (e: Event) => {
-        if (dragging?.initialScrollTop !== undefined && trackRef.current) {
-          trackRef.current.scrollTop = dragging.initialScrollTop;
-        }
-      };
-      trackRef.current.addEventListener('scroll', preventScroll);
-      return () => {
-        trackRef.current?.removeEventListener('scroll', preventScroll);
-      };
-    }
-  }, [dragging]);
 
   /** === 出力テキスト === */
   const selectedSlotsSorted = useMemo(
@@ -501,7 +471,7 @@ export default function App() {
                     isActive 
                       ? "bg-teal-100 border-teal-300" 
                       : isToday 
-                        ? "bg-gray-100 border-gray-400" 
+                        ? "bg-gray-100 border-gray-400 font-bold" 
                         : "bg-white border-gray-200 hover:bg-gray-50"
                   }`}
                 >
@@ -515,37 +485,49 @@ export default function App() {
           </div>
         </div>
 
-        {/* === 時間トラック（長押し→30分枠 / ○ボタンでリサイズ / 枠内ドラッグで移動） === */}
+        {/* === 時間トラック（長押し→30分枠 / ○ボタンでリサイズのみ） === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
           <div className="text-sm font-medium mb-2">{activeDateISO} の時間選択</div>
-          <div className="text-xs text-gray-500 mb-2">長押しで30分枠作成 → ○ボタンで伸縮 / 枠内で移動</div>
+          <div className="text-xs text-gray-500 mb-2">長押しで30分枠作成 → ○ボタンで時間調整</div>
           <div
             ref={trackRef}
-            className="relative h-[420px] overflow-auto border rounded-lg select-none"
-            style={{
-              background: `
-                repeating-linear-gradient(
-                  to bottom,
-                  transparent 0px,
-                  transparent ${ROW_HEIGHT * 2 - 0.5}px,
-                  #e2e8f0 ${ROW_HEIGHT * 2 - 0.5}px,
-                  #e2e8f0 ${ROW_HEIGHT * 2}px
-                ),
-                repeating-linear-gradient(
-                  to bottom,
-                  transparent 0px,
-                  transparent ${ROW_HEIGHT * 4 - 1}px,
-                  #cbd5e1 ${ROW_HEIGHT * 4 - 1}px,
-                  #cbd5e1 ${ROW_HEIGHT * 4}px
-                )
-              `,
-              backgroundColor: '#f8fafc'
-            }}
+            className="relative h-[420px] overflow-auto border rounded-lg select-none bg-gray-50"
             onPointerDown={onTrackPointerDown}
             onPointerMove={onTrackPointerMove}
             onPointerUp={onTrackPointerUp}
             onPointerCancel={onTrackPointerUp}
           >
+            {/* スクロールに追従する背景パターン */}
+            <div 
+              className="absolute left-0 w-full pointer-events-none"
+              style={{ height: TRACK_HEIGHT }}
+            >
+              {/* 30分線（細い線） */}
+              {Array.from({ length: 48 }).map((_, i) => {
+                const m = i * 30;
+                const y = minuteToY(m);
+                return (
+                  <div
+                    key={`30-${i}`}
+                    className="absolute left-0 right-0 border-t border-gray-300"
+                    style={{ top: y }}
+                  />
+                );
+              })}
+              {/* 1時間線（太い線） */}
+              {Array.from({ length: 25 }).map((_, i) => {
+                const m = i * 60;
+                const y = minuteToY(m);
+                return (
+                  <div
+                    key={`60-${i}`}
+                    className="absolute left-0 right-0 border-t border-gray-500"
+                    style={{ top: y }}
+                  />
+                );
+              })}
+            </div>
+
             {/* 時刻目盛り */}
             <div className="absolute left-0 top-0 w-full pointer-events-none">
               {Array.from({ length: 25 }).map((_, i) => {
@@ -553,7 +535,7 @@ export default function App() {
                 const m = hour * 60;
                 const y = minuteToY(m);
                 return (
-                  <div key={i} style={{ top: y - 8 }} className="absolute left-2 text-[11px] text-gray-500 font-medium">
+                  <div key={i} style={{ top: y - 8 }} className="absolute left-2 text-[11px] text-gray-600 font-medium bg-gray-50 px-1 rounded">
                     {`${pad(hour)}:00`}
                   </div>
                 );
@@ -565,36 +547,28 @@ export default function App() {
               const top = minuteToY(s.start);
               const height = minuteToY(s.end) - minuteToY(s.start);
               const active = dragging?.slotId === s.id;
-              const isMoving = active && dragging?.mode === 'move';
               return (
                 <div
                   key={s.id}
                   className={`absolute left-12 right-3 rounded-lg border select-none transition-opacity ${
                     active ? "bg-teal-500/30 border-teal-700 shadow-md" : "bg-teal-500/20 border-teal-500"
-                  } ${isMoving ? 'opacity-50' : ''}`}
+                  }`}
                   style={{ 
                     top, 
                     height,
                     transition: dragging?.slotId === s.id ? 'none' : 'all 150ms ease-out'
                   }}
-                  onPointerDown={(e) => {
-                    // 枠内をクリックしたら移動モード
-                    const target = e.target as HTMLElement;
-                    if (!target.classList.contains('resize-handle') && !target.classList.contains('delete-btn')) {
-                      onHandleDown(e, 'move', s);
-                    }
-                  }}
                 >
-                  {/* 右上リサイズハンドル（○ボタン） - 少し内側に配置 */}
+                  {/* 右上リサイズハンドル（○ボタン） - 85%の位置 */}
                   <div
                     className="resize-handle absolute w-4 h-4 bg-teal-600 rounded-full cursor-nw-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
-                    style={{ top: '-6px', right: '10%' }}
+                    style={{ top: '-6px', right: '15%' }}
                     onPointerDown={(e) => onHandleDown(e, "resize-start", s)}
                   />
-                  {/* 左下リサイズハンドル（○ボタン） - 少し内側に配置 */}
+                  {/* 左下リサイズハンドル（○ボタン） - 15%の位置 */}
                   <div
                     className="resize-handle absolute w-4 h-4 bg-teal-600 rounded-full cursor-se-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
-                    style={{ bottom: '-6px', left: '10%' }}
+                    style={{ bottom: '-6px', left: '15%' }}
                     onPointerDown={(e) => onHandleDown(e, "resize-end", s)}
                   />
                   {/* ラベル & 削除 */}
@@ -602,6 +576,7 @@ export default function App() {
                     <div className="text-xs font-medium pointer-events-none">{mm(s.start)}〜{mm(s.end)}</div>
                     <button
                       className="delete-btn px-2 py-0.5 text-[10px] rounded bg-white/90 border hover:bg-red-50 pointer-events-auto"
+                      style={{ marginRight: '1px' }}
                       onClick={() => removeSlot(s.id)}
                       onPointerDown={(e) => e.stopPropagation()}
                     >
@@ -612,7 +587,7 @@ export default function App() {
               );
             })}
 
-            {/* リサイズ/移動中プレビュー */}
+            {/* リサイズ中プレビュー */}
             {hoverRange && dragging && (
               <div
                 className="absolute left-12 right-3 rounded-lg border-2 border-dashed border-teal-700 bg-teal-300/40 pointer-events-none"
@@ -688,12 +663,12 @@ export default function App() {
             onChange={(e) => renameTemplate(activeTplId, e.target.value)}
           />
 
-          {/* 本文 */}
+          {/* 本文 - サイズを1.3倍に */}
           <label className="block text-sm font-medium mb-1">
             テンプレ本文（{"{{宛先名}}"} / {"{{候補一覧}}"} を差し込み）
           </label>
           <textarea
-            className="w-full h-36 px-3 py-2 rounded border font-mono text-sm"
+            className="w-full h-48 px-3 py-2 rounded border font-mono text-sm"
             value={activeTpl?.content ?? ""}
             onChange={(e) => updateTemplateContent(activeTplId, e.target.value)}
           />
@@ -707,10 +682,10 @@ export default function App() {
             </button>
           </div>
 
-          {/* 出力 */}
+          {/* 出力 - サイズを1.3倍に */}
           <div className="mt-4">
             <label className="block text-sm font-medium mb-1">出力</label>
-            <textarea className="w-full h-40 px-3 py-2 rounded border font-mono text-sm" value={outputText} readOnly />
+            <textarea className="w-full h-52 px-3 py-2 rounded border font-mono text-sm" value={outputText} readOnly />
             <div className="mt-2 flex justify-end">
               <button onClick={copy} className="px-4 py-2 rounded bg-teal-600 text-white hover:bg-teal-700">
                 コピー
