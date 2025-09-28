@@ -76,6 +76,7 @@ const defaultTemplates: Tpl[] = [
 export default function App() {
   // iPhone/LINE対策：ドラッグ中はページスクロールをロック
   const [lockPageScroll, setLockPageScroll] = useState(false);
+  const [trackOverscrollContain, setTrackOverscrollContain] = useState(false);
   /** ▼ URLの uid で保存領域を分離（?uid=xxxx） */
   const uid = useMemo(() => {
     try {
@@ -326,6 +327,8 @@ export default function App() {
     setDragging(null);
     setHoverRange(null);
     vibrate(10);
+    setLockPageScroll(false);
+    setTrackOverscrollContain(false);
   };
 
   useEffect(() => {
@@ -336,6 +339,7 @@ export default function App() {
       document.removeEventListener("pointerup", onDocPointerUp);
       stopAutoScroll();
       setLockPageScroll(false);
+      setTrackOverscrollContain(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dragging, hoverRange, activeDateISO, slots]);
@@ -553,11 +557,11 @@ export default function App() {
           <div className="text-sm font-medium mb-2">{displayActiveDate} の時間選択</div>
           <div
             ref={trackRef}
-            className="relative h-[420px] overflow-auto border rounded-lg select-none bg-gray-50 overscroll-contain" style={{ WebkitOverflowScrolling: 'touch' as any, overscrollBehaviorY: 'contain' as any }}
-            onPointerDown={(e) => { setLockPageScroll(true); onTrackPointerDown(e); }}
+            className="relative h-[420px] overflow-auto border rounded-lg select-none bg-gray-50" style={{ WebkitOverflowScrolling: 'touch' as any, overscrollBehaviorY: (trackOverscrollContain ? 'contain' : 'auto') as any }}
+            onPointerDown={onTrackPointerDown}
             onPointerMove={onTrackPointerMove}
-            onPointerUp={(e) => { onTrackPointerUp(e); setLockPageScroll(false); }}
-            onPointerCancel={(e) => { onTrackPointerUp(e); setLockPageScroll(false); }}
+            onPointerUp={onTrackPointerUp}
+            onPointerCancel={onTrackPointerUp}
           >
             {/* スクロールに追従する背景パターン */}
             <div 
@@ -625,13 +629,13 @@ export default function App() {
                   <div
                     className="resize-handle absolute w-[18px] h-[18px] bg-teal-600 rounded-full cursor-nw-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
                     style={{ top: '-7px', right: '15%' }}
-                    onPointerDown={(e) => { setLockPageScroll(true); onHandleDown(e, "resize-start", s); }}
+                    onPointerDown={(e) => { setLockPageScroll(true); setTrackOverscrollContain(true); onHandleDown(e, "resize-start", s); }}
                   />
                   {/* 左下リサイズハンドル（○ボタン） - 15%の位置、10%大きく */}
                   <div
                     className="resize-handle absolute w-[18px] h-[18px] bg-teal-600 rounded-full cursor-se-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
                     style={{ bottom: '-7px', left: '15%' }}
-                    onPointerDown={(e) => { setLockPageScroll(true); onHandleDown(e, "resize-end", s); }}
+                    onPointerDown={(e) => { setLockPageScroll(true); setTrackOverscrollContain(true); onHandleDown(e, "resize-end", s); }}
                   />
                   {/* ラベル & 削除 */}
                   <div className="absolute inset-0 flex items-center justify-between px-2 py-1 pointer-events-none">
