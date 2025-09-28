@@ -68,15 +68,40 @@ const tpl1 =
 
 const defaultTemplates: Tpl[] = [
   { id: "tpl-1", name: "はじめまして用", content: tpl1 },
-  { id: "tpl-2", name: "対面商談用", content: "" },
-  { id: "tpl-3", name: "オンライン用", content: "" },
+  { id: "tpl-2", name: "対面商談用", content: tpl1 },
+  { id: "tpl-3", name: "オンライン用", content: tpl1 },
 ];
+
+/** ====== 純関数（テストしやすい形） ====== */
+// 空白テンプレを tpl1 で埋める
+const fillEmptyTemplates = (arr: Tpl[]): Tpl[] =>
+  arr.map(t => (t.content && t.content.trim() !== "" ? t : { ...t, content: tpl1 }));
+
+// 候補一覧の整形（純関数化してDevTestできるように）
+const formatCandidateList = (sortedSlots: Slot[]): string => {
+  if (!sortedSlots || sortedSlots.length === 0) return "（候補なし）";
+  const fmt = (iso: string) => {
+    const [y, m, d] = iso.split('-').map(Number);
+    const dd = new Date(y, m - 1, d);
+    return `${m}月${d}日（${"月火水木金土日"[weekdayMonStart(dd.getDay())]}）`;
+  };
+  const grouped: Record<string, Slot[]> = {};
+  for (const s of sortedSlots) (grouped[s.dateISO] ??= []).push(s);
+  const lines: string[] = [];
+  for (const iso of Object.keys(grouped).sort()) {
+    const times = grouped[iso].map(s => `${mm(s.start)}〜${mm(s.end)}`).join("、");
+    lines.push(`・${fmt(iso)}：${times}`);
+  }
+  return lines.join("\n");
+};
 
 /** ====== 本体 ====== */
 export default function App() {
   // iPhone/LINE対策：ドラッグ中はページスクロールをロック
   const [lockPageScroll, setLockPageScroll] = useState(false);
+  // ドラッグ時のみ内側のオーバースクロールを抑止（通常は親へスクロール連鎖）
   const [trackOverscrollContain, setTrackOverscrollContain] = useState(false);
+
   /** ▼ URLの uid で保存領域を分離（?uid=xxxx） */
   const uid = useMemo(() => {
     try {
@@ -101,6 +126,14 @@ export default function App() {
   // データ（保存）
   const [slots, setSlots] = useSafeLocalStorage<Slot[]>(ns("slots"), []);
   const [templates, setTemplates] = useSafeLocalStorage<Tpl[]>(ns("templates"), defaultTemplates);
+
+  // 空白テンプレを自動的に「はじめまして用」と同じ内容で補完（既存の非空テンプレは変更しない）
+  useEffect(() => {
+    if (templates.some(t => (t.content ?? "").trim() === "")) {
+      setTemplates(prev => fillEmptyTemplates(prev));
+    }
+  }, [templates, setTemplates]);
+
   const [activeTplId, setActiveTplId] = useSafeLocalStorage<string>(ns("activeTplId"), "tpl-1");
   const [toName, setToName] = useSafeLocalStorage<string>(ns("toName"), "");
 
@@ -353,26 +386,7 @@ export default function App() {
     [slots]
   );
 
-  const candidateListText = useMemo(() => {
-    if (selectedSlotsSorted.length === 0) return "（候補なし）";
-    const fmt = (iso: string) => {
-      // ISO文字列を直接パースしてタイムゾーンの影響を避ける（すでにローカル基準だが安全側で維持）
-      const [year, month, day] = iso.split('-').map(Number);
-      const d = new Date(year, month - 1, day);
-      const md = `${month}月${day}日（${"月火水木金土日"[weekdayMonStart(d.getDay())]}）`;
-      return md;
-    };
-    const grouped: Record<string, Slot[]> = {};
-    selectedSlotsSorted.forEach((s) => ((grouped[s.dateISO] ??= []).push(s)));
-    const lines: string[] = [];
-    Object.keys(grouped)
-      .sort()
-      .forEach((iso) => {
-        const times = grouped[iso].map((s) => `${mm(s.start)}〜${mm(s.end)}`).join("、");
-        lines.push(`・${fmt(iso)}：${times}`);
-      });
-    return lines.join("\n");
-  }, [selectedSlotsSorted]);
+  const candidateListText = useMemo(() => formatCandidateList(selectedSlotsSorted), [selectedSlotsSorted]);
 
   const activeTpl = useMemo(() => templates.find(t => t.id === activeTplId) || templates[0], [templates, activeTplId]);
   const outputText = useMemo(() => {
@@ -410,7 +424,7 @@ export default function App() {
     const newTemplate: Tpl = {
       id: newId,
       name: `テンプレート${templates.length + 1}`,
-      content: ""
+      content: tpl1,
     };
     setTemplates(prev => [...prev, newTemplate]);
     setActiveTplId(newId);
@@ -434,7 +448,7 @@ export default function App() {
     setTemplates(prev => prev.map(t => t.id === id ? { ...t, content } : t));
   
   const resetTemplate = (id: string) =>
-    setTemplates(prev => prev.map(t => t.id === id ? { ...t, content: "" } : t));
+    setTemplates(prev => prev.map(t => t.id === id ? { ...t, content: tpl1 } : t));
 
   /** === 候補一覧（削除つき） === */
   function renderGroupedListWithRemove() {
@@ -442,13 +456,14 @@ export default function App() {
     selectedSlotsSorted.forEach((s) => ((grouped[s.dateISO] ??= []).push(s)));
     const keys = Object.keys(grouped).sort();
     if (keys.length === 0) return <div className="text-sm text-gray-400">（候補なし）</div>;
+
     return (
       <div className="space-y-2">
         {keys.map((iso) => {
           // ISO文字列を直接パースしてタイムゾーンの影響を避ける（ローカル基準維持）
-          const [year, month, day] = iso.split('-').map(Number);
-          const d = new Date(year, month - 1, day);
-          const title = `${month}月${day}日（${"月火水木金土日"[weekdayMonStart(d.getDay())]}）`;
+          const [yy, mmn, dd] = iso.split('-').map(Number);
+          const d = new Date(yy, mmn - 1, dd);
+          const title = `${mmn}月${dd}日（${"月火水木金土日"[weekdayMonStart(d.getDay())]}）`;
           return (
             <div key={iso}>
               <div className="text-sm font-semibold mb-1">{title}</div>
@@ -500,6 +515,39 @@ export default function App() {
       window.scrollTo(0, prevTop);
     };
   }, [lockPageScroll]);
+
+  // 🔎 簡易デブテスト（本番影響なし）
+  useEffect(() => {
+    try {
+      // toISODateLocal
+      const d = new Date(2025, 8, 28); // Sep (0-based month)
+      console.assert(toISODateLocal(d) === '2025-09-28', 'toISODateLocal failed');
+
+      // defaultTemplates non-empty
+      console.assert(defaultTemplates.every(t => (t.content || '').length > 0), 'defaultTemplates should not be empty');
+
+      // fillEmptyTemplates
+      const filled = fillEmptyTemplates([
+        { id: 'x', name: 'X', content: '' },
+        { id: 'y', name: 'Y', content: ' ok ' },
+      ]);
+      console.assert(filled[0].content === tpl1 && filled[1].content.trim() === 'ok', 'fillEmptyTemplates failed');
+
+      // formatCandidateList
+      const sample: Slot[] = [
+        { id: 'a', dateISO: '2025-09-28', start: 540, end: 600 },
+        { id: 'b', dateISO: '2025-09-28', start: 630, end: 690 },
+        { id: 'c', dateISO: '2025-09-29', start: 540, end: 570 },
+      ];
+      const out = formatCandidateList(sample);
+      console.assert(out.includes('09:00〜10:00') && out.includes('10:30〜11:30') && out.includes('2025-09-29') === false, 'formatCandidateList content failed');
+      console.assert(formatCandidateList([]) === '（候補なし）', 'formatCandidateList empty failed');
+
+      console.log('[DevTest] OK');
+    } catch (e) {
+      console.warn('[DevTest] failed', e);
+    }
+  }, []);
 
   return (
     <div className="min-h-screen bg-gray-50" style={{ paddingTop: 'env(safe-area-inset-top)', overscrollBehaviorY: 'contain' as any }}>
@@ -557,7 +605,8 @@ export default function App() {
           <div className="text-sm font-medium mb-2">{displayActiveDate} の時間選択</div>
           <div
             ref={trackRef}
-            className="relative h-[420px] overflow-auto border rounded-lg select-none bg-gray-50" style={{ WebkitOverflowScrolling: 'touch' as any, overscrollBehaviorY: (trackOverscrollContain ? 'contain' : 'auto') as any }}
+            className="relative h-[420px] overflow-auto border rounded-lg select-none bg-gray-50"
+            style={{ WebkitOverflowScrolling: 'touch' as any, overscrollBehaviorY: (trackOverscrollContain ? 'contain' : 'auto') as any }}
             onPointerDown={onTrackPointerDown}
             onPointerMove={onTrackPointerMove}
             onPointerUp={onTrackPointerUp}
