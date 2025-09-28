@@ -3,20 +3,21 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 /** ====== 型 ====== */
 type Slot = {
   id: string;
-  dateISO: string; // "2025-09-25"
+  dateISO: string; // "2025-09-25"（ローカルタイム基準）
   start: number;   // minutes 0..1440
   end: number;     // minutes 0..1440 (start < end)
 };
 
 type Tpl = {
-  id: string;         // 固定ID "tpl-1" | "tpl-2" | "tpl-3"
+  id: string;         // 固定ID "tpl-1" | "tpl-2" | "tpl-3" | ...
   name: string;       // テンプレ名（タブ表示）
   content: string;    // 本文（{{宛先名}} / {{候補一覧}}）
 };
 
 /** ====== ユーティリティ ====== */
-const toISODate = (d: Date) => d.toISOString().slice(0, 10);
+// ★ 重要：ローカルタイムでISOっぽい日付を作る（toISOStringはUTCになるため前日/翌日ずれが発生）
 const pad = (n: number) => (n < 10 ? `0${n}` : `${n}`);
+const toISODateLocal = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const mm = (m: number) => `${pad((m / 60) | 0)}:${pad(m % 60)}`;
 const floorTo15 = (m: number) => Math.floor(m / 15) * 15;
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
@@ -62,7 +63,7 @@ function useSafeLocalStorage<T>(key: string, initial: T) {
 
 /** ====== デフォルトテンプレ ====== */
 const tpl1 =
-  `{{宛先名}} 様\n\n以下の日程のいずれかでご都合いかがでしょうか？\n\n{{候補一覧}}\n` +
+  `{{宛先名}} 様\n\n平素よりお世話になっております。\n面談のご日程に関しまして、以下の日程のいずれかでご都合いかがでしょうか？\n\n{{候補一覧}}\n` +
   `上記日時でもしご都合が合わない際は再度調整いたしますので、ご一報いただけますと幸いです。\n何卒宜しくお願いいたします。`;
 
 const defaultTemplates: Tpl[] = [
@@ -73,6 +74,8 @@ const defaultTemplates: Tpl[] = [
 
 /** ====== 本体 ====== */
 export default function App() {
+  // iPhone/LINE対策：ドラッグ中はページスクロールをロック
+  const [lockPageScroll, setLockPageScroll] = useState(false);
   /** ▼ URLの uid で保存領域を分離（?uid=xxxx） */
   const uid = useMemo(() => {
     try {
@@ -84,12 +87,15 @@ export default function App() {
   }, []);
   const ns = (k: string) => `am_${k}_${uid}`;
 
-  // 今日 & カレンダー表示年月
-  const today = useMemo(() => new Date(), []);
-  const todayISO = useMemo(() => toISODate(today), [today]);
+  // 今日 & カレンダー表示年月（ローカルタイム基準）
+  const today = useMemo(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  }, []);
+  const todayISO = useMemo(() => toISODateLocal(today), [today]);
   const [year, setYear] = useSafeLocalStorage<number>(ns("year"), today.getFullYear());
   const [month, setMonth] = useSafeLocalStorage<number>(ns("month"), today.getMonth());
-  const [activeDateISO, setActiveDateISO] = useSafeLocalStorage<string>(ns("activeDate"), toISODate(today));
+  const [activeDateISO, setActiveDateISO] = useSafeLocalStorage<string>(ns("activeDate"), toISODateLocal(today));
 
   // データ（保存）
   const [slots, setSlots] = useSafeLocalStorage<Slot[]>(ns("slots"), []);
@@ -329,6 +335,7 @@ export default function App() {
       document.removeEventListener("pointermove", onDocPointerMove);
       document.removeEventListener("pointerup", onDocPointerUp);
       stopAutoScroll();
+      setLockPageScroll(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dragging, hoverRange, activeDateISO, slots]);
@@ -345,8 +352,10 @@ export default function App() {
   const candidateListText = useMemo(() => {
     if (selectedSlotsSorted.length === 0) return "（候補なし）";
     const fmt = (iso: string) => {
-      const d = new Date(iso + "T00:00:00");
-      const md = `${d.getMonth() + 1}月${d.getDate()}日（${"月火水木金土日"[weekdayMonStart(d.getDay())]}）`;
+      // ISO文字列を直接パースしてタイムゾーンの影響を避ける（すでにローカル基準だが安全側で維持）
+      const [year, month, day] = iso.split('-').map(Number);
+      const d = new Date(year, month - 1, day);
+      const md = `${month}月${day}日（${"月火水木金土日"[weekdayMonStart(d.getDay())]}）`;
       return md;
     };
     const grouped: Record<string, Slot[]> = {};
@@ -391,6 +400,38 @@ export default function App() {
 
   const weekdayClasses = ["", "", "", "", "", "text-blue-600", "text-red-600"];
 
+  /** === テンプレート管理 === */
+  const addTemplate = () => {
+    const newId = `tpl-${Date.now()}`;
+    const newTemplate: Tpl = {
+      id: newId,
+      name: `テンプレート${templates.length + 1}`,
+      content: ""
+    };
+    setTemplates(prev => [...prev, newTemplate]);
+    setActiveTplId(newId);
+  };
+
+  const deleteTemplate = (id: string) => {
+    if (templates.length <= 1) {
+      alert("最後のテンプレートは削除できません");
+      return;
+    }
+    setTemplates(prev => prev.filter(t => t.id !== id));
+    if (activeTplId === id) {
+      setActiveTplId(templates.find(t => t.id !== id)?.id || templates[0].id);
+    }
+  };
+
+  const renameTemplate = (id: string, name: string) =>
+    setTemplates(prev => prev.map(t => t.id === id ? { ...t, name } : t));
+  
+  const updateTemplateContent = (id: string, content: string) =>
+    setTemplates(prev => prev.map(t => t.id === id ? { ...t, content } : t));
+  
+  const resetTemplate = (id: string) =>
+    setTemplates(prev => prev.map(t => t.id === id ? { ...t, content: "" } : t));
+
   /** === 候補一覧（削除つき） === */
   function renderGroupedListWithRemove() {
     const grouped: Record<string, Slot[]> = {};
@@ -400,8 +441,10 @@ export default function App() {
     return (
       <div className="space-y-2">
         {keys.map((iso) => {
-          const d = new Date(iso + "T00:00:00");
-          const title = `${d.getMonth() + 1}月${d.getDate()}日（${"月火水木金土日"[weekdayMonStart(d.getDay())]}）`;
+          // ISO文字列を直接パースしてタイムゾーンの影響を避ける（ローカル基準維持）
+          const [year, month, day] = iso.split('-').map(Number);
+          const d = new Date(year, month - 1, day);
+          const title = `${month}月${day}日（${"月火水木金土日"[weekdayMonStart(d.getDay())]}）`;
           return (
             <div key={iso}>
               <div className="text-sm font-semibold mb-1">{title}</div>
@@ -426,16 +469,36 @@ export default function App() {
     );
   }
 
-  /** === テンプレUI（3枠・保存） === */
-  const renameTemplate = (id: string, name: string) =>
-    setTemplates(prev => prev.map(t => t.id === id ? { ...t, name } : t));
-  const updateTemplateContent = (id: string, content: string) =>
-    setTemplates(prev => prev.map(t => t.id === id ? { ...t, content } : t));
-  const resetTemplate = (id: string) =>
-    setTemplates(prev => prev.map(t => t.id === id ? { ...t, content: "" } : t));
+  // アクティブな日付の表示用（選択されたローカルISO日付をそのまま使用）
+  const displayActiveDate = useMemo(() => {
+    return activeDateISO;
+  }, [activeDateISO]);
+
+  // iPhoneのアドレスバー折りたたみやLINE内ブラウザのプルダウン閉じを軽減
+  useEffect(() => {
+    if (!lockPageScroll) return;
+    const body = document.body;
+    const html = document.documentElement;
+    const prevOverflowBody = body.style.overflow;
+    const prevOverflowHtml = html.style.overflow;
+    const prevPos = body.style.position;
+    const prevTop = window.scrollY;
+    body.style.overflow = 'hidden';
+    html.style.overflow = 'hidden';
+    body.style.position = 'fixed';
+    body.style.width = '100%';
+    body.style.top = `-${prevTop}px`;
+    return () => {
+      body.style.overflow = prevOverflowBody;
+      html.style.overflow = prevOverflowHtml;
+      body.style.position = prevPos;
+      body.style.top = '';
+      window.scrollTo(0, prevTop);
+    };
+  }, [lockPageScroll]);
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-gray-50" style={{ paddingTop: 'env(safe-area-inset-top)', overscrollBehaviorY: 'contain' as any }}>
       <div className="mx-auto max-w-md p-4">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-bold mb-3">アポイント文作成</h1>
@@ -457,7 +520,7 @@ export default function App() {
           <div className="grid grid-cols-7 gap-1">
             {weeks.flat().map((d, idx) => {
               if (!d) return <div key={idx} className="h-10 rounded bg-transparent" />;
-              const iso = toISODate(d);
+              const iso = toISODateLocal(d);
               const isActive = iso === activeDateISO;
               const isToday = iso === todayISO;
               const wd = weekdayMonStart(d.getDay());
@@ -487,14 +550,14 @@ export default function App() {
 
         {/* === 時間トラック（長押し→30分枠 / ○ボタンでリサイズのみ） === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
-          <div className="text-sm font-medium mb-2">{activeDateISO} の時間選択</div>
+          <div className="text-sm font-medium mb-2">{displayActiveDate} の時間選択</div>
           <div
             ref={trackRef}
-            className="relative h-[420px] overflow-auto border rounded-lg select-none bg-gray-50"
-            onPointerDown={onTrackPointerDown}
+            className="relative h-[420px] overflow-auto border rounded-lg select-none bg-gray-50 overscroll-contain" style={{ WebkitOverflowScrolling: 'touch' as any, overscrollBehaviorY: 'contain' as any }}
+            onPointerDown={(e) => { setLockPageScroll(true); onTrackPointerDown(e); }}
             onPointerMove={onTrackPointerMove}
-            onPointerUp={onTrackPointerUp}
-            onPointerCancel={onTrackPointerUp}
+            onPointerUp={(e) => { onTrackPointerUp(e); setLockPageScroll(false); }}
+            onPointerCancel={(e) => { onTrackPointerUp(e); setLockPageScroll(false); }}
           >
             {/* スクロールに追従する背景パターン */}
             <div 
@@ -550,7 +613,7 @@ export default function App() {
                 <div
                   key={s.id}
                   className={`absolute left-12 right-3 rounded-lg border select-none transition-opacity ${
-                    active ? "bg-teal-500/30 border-teal-700 shadow-md" : "bg-teal-500/20 border-teal-500"
+                    active ? "bg-teal-300/20 border-teal-500" : "bg-teal-500/30 border-teal-700 shadow-md"
                   }`}
                   style={{ 
                     top, 
@@ -558,17 +621,17 @@ export default function App() {
                     transition: dragging?.slotId === s.id ? 'none' : 'all 150ms ease-out'
                   }}
                 >
-                  {/* 右上リサイズハンドル（○ボタン） - 85%の位置 */}
+                  {/* 右上リサイズハンドル（○ボタン） - 85%の位置、10%大きく */}
                   <div
-                    className="resize-handle absolute w-4 h-4 bg-teal-600 rounded-full cursor-nw-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
-                    style={{ top: '-6px', right: '15%' }}
-                    onPointerDown={(e) => onHandleDown(e, "resize-start", s)}
+                    className="resize-handle absolute w-[18px] h-[18px] bg-teal-600 rounded-full cursor-nw-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
+                    style={{ top: '-7px', right: '15%' }}
+                    onPointerDown={(e) => { setLockPageScroll(true); onHandleDown(e, "resize-start", s); }}
                   />
-                  {/* 左下リサイズハンドル（○ボタン） - 15%の位置 */}
+                  {/* 左下リサイズハンドル（○ボタン） - 15%の位置、10%大きく */}
                   <div
-                    className="resize-handle absolute w-4 h-4 bg-teal-600 rounded-full cursor-se-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
-                    style={{ bottom: '-6px', left: '15%' }}
-                    onPointerDown={(e) => onHandleDown(e, "resize-end", s)}
+                    className="resize-handle absolute w-[18px] h-[18px] bg-teal-600 rounded-full cursor-se-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
+                    style={{ bottom: '-7px', left: '15%' }}
+                    onPointerDown={(e) => { setLockPageScroll(true); onHandleDown(e, "resize-end", s); }}
                   />
                   {/* ラベル & 削除 */}
                   <div className="absolute inset-0 flex items-center justify-between px-2 py-1 pointer-events-none">
@@ -589,7 +652,7 @@ export default function App() {
             {/* リサイズ中プレビュー */}
             {hoverRange && dragging && (
               <div
-                className="absolute left-12 right-3 rounded-lg border-2 border-dashed border-teal-700 bg-teal-300/40 pointer-events-none"
+                className="absolute left-12 right-3 rounded-lg border-2 border-dashed border-teal-500 bg-teal-200/40 pointer-events-none"
                 style={{ 
                   top: minuteToY(hoverRange.start), 
                   height: minuteToY(hoverRange.end) - minuteToY(hoverRange.start),
@@ -623,7 +686,7 @@ export default function App() {
           {renderGroupedListWithRemove()}
         </div>
 
-        {/* === テンプレ（3枠・保存） === */}
+        {/* === テンプレ（動的追加・削除対応） === */}
         <div className="bg-white rounded-xl shadow p-3 mb-4">
           <div className="flex gap-2 mb-2 items-center">
             <input
@@ -642,16 +705,33 @@ export default function App() {
           </div>
 
           {/* テンプレタブ */}
-          <div className="flex gap-2 mb-3">
+          <div className="flex gap-2 mb-3 flex-wrap">
             {templates.map((t) => (
-              <button
-                key={t.id}
-                className={`px-3 py-1 rounded border text-sm ${activeTplId === t.id ? "bg-teal-600 text-white border-teal-700" : "bg-white border-gray-300 hover:bg-gray-50"}`}
-                onClick={() => setActiveTplId(t.id)}
-              >
-                {t.name || (t.id === "tpl-1" ? "はじめまして用" : t.id === "tpl-2" ? "対面商談用" : "オンライン用")}
-              </button>
+              <div key={t.id} className="flex items-center">
+                <button
+                  className={`px-3 py-1 rounded-l border text-sm ${activeTplId === t.id ? "bg-teal-600 text-white border-teal-700" : "bg-white border-gray-300 hover:bg-gray-50"}`}
+                  onClick={() => setActiveTplId(t.id)}
+                >
+                  {t.name || `テンプレート${templates.indexOf(t) + 1}`}
+                </button>
+                {templates.length > 1 && (
+                  <button
+                    className={`px-2 py-1 rounded-r border-t border-r border-b text-xs hover:bg-red-50 ${activeTplId === t.id ? "border-teal-700 text-red-600" : "border-gray-300 text-red-500"}`}
+                    onClick={() => deleteTemplate(t.id)}
+                    title="このテンプレを削除"
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
             ))}
+            <button
+              className="px-3 py-1 rounded border border-gray-300 bg-green-50 hover:bg-green-100 text-sm text-green-700"
+              onClick={addTemplate}
+              title="新しいテンプレを追加"
+            >
+              + 追加
+            </button>
           </div>
 
           {/* テンプレ名編集 */}
