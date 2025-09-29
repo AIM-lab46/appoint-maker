@@ -502,17 +502,25 @@ export default function App() {
     const prevOverflowHtml = html.style.overflow;
     const prevPos = body.style.position;
     const prevTop = window.scrollY;
+    // 1) ページを固定
     body.style.overflow = 'hidden';
     html.style.overflow = 'hidden';
     body.style.position = 'fixed';
     body.style.width = '100%';
     body.style.top = `-${prevTop}px`;
+    // 2) iOS対策：ドラッグ中は非パッシブの touchmove / wheel を抑止
+    const prevent = (e: Event) => { e.preventDefault(); };
+    document.addEventListener('touchmove', prevent, { passive: false });
+    document.addEventListener('wheel', prevent as any, { passive: false } as any);
+
     return () => {
       body.style.overflow = prevOverflowBody;
       html.style.overflow = prevOverflowHtml;
       body.style.position = prevPos;
       body.style.top = '';
       window.scrollTo(0, prevTop);
+      document.removeEventListener('touchmove', prevent as any);
+      document.removeEventListener('wheel', prevent as any);
     };
   }, [lockPageScroll]);
 
@@ -676,21 +684,21 @@ export default function App() {
                 >
                   {/* 右上リサイズハンドル（○ボタン） - 85%の位置、10%大きく */}
                   <div
-                    className="resize-handle absolute w-[18px] h-[18px] bg-teal-600 rounded-full cursor-nw-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
-                    style={{ top: '-7px', right: '15%' }}
+                    className="resize-handle absolute w-[24px] h-[24px] bg-teal-600 rounded-full cursor-nw-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
+                    style={{ top: '-10px', right: '15%' }}
                     onPointerDown={(e) => { setLockPageScroll(true); setTrackOverscrollContain(true); onHandleDown(e, "resize-start", s); }}
                   />
                   {/* 左下リサイズハンドル（○ボタン） - 15%の位置、10%大きく */}
                   <div
-                    className="resize-handle absolute w-[18px] h-[18px] bg-teal-600 rounded-full cursor-se-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
-                    style={{ bottom: '-7px', left: '15%' }}
+                    className="resize-handle absolute w-[24px] h-[24px] bg-teal-600 rounded-full cursor-se-resize touch-none hover:bg-teal-700 hover:scale-110 transition-all shadow-md"
+                    style={{ bottom: '-10px', left: '15%' }}
                     onPointerDown={(e) => { setLockPageScroll(true); setTrackOverscrollContain(true); onHandleDown(e, "resize-end", s); }}
                   />
                   {/* ラベル & 削除 */}
                   <div className="absolute inset-0 flex items-center justify-between px-2 py-1 pointer-events-none">
                     <div className="text-xs font-medium pointer-events-none">{mm(s.start)}〜{mm(s.end)}</div>
                     <button
-                      className="delete-btn px-2 py-0.5 text-[10px] rounded bg-white/90 border hover:bg-red-50 pointer-events-auto"
+                      className="delete-btn px-3 py-1 text-[12px] rounded-lg bg-white/90 border hover:bg-red-50 pointer-events-auto"
                       style={{ marginRight: '1px' }}
                       onClick={() => removeSlot(s.id)}
                       onPointerDown={(e) => e.stopPropagation()}
